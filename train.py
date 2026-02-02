@@ -302,23 +302,23 @@ else:
         "MultiInputPolicy",  # MlpPolicy 대신 MultiInputPolicy 사용
         env,
         verbose=2,
-        n_steps=1024,
-        batch_size=256,
+        n_steps=512,
+        batch_size=128,
         gamma=0.99,
-        gae_lambda=1.0,  # 일반 Advantage 사용
+        gae_lambda=0.9,
         learning_rate=1e-4,
         clip_range=0.2,
-        vf_coef=0.0,  # 가치 함수 제거
+        vf_coef=0.5,
         max_grad_norm=0.5,
         ent_coef=0.01,
         tensorboard_log="./ppo_MultiInputPolicy/",
         #policy_kwargs={
-        #    "net_arch": [dict(pi=[256,128,64,32], vf=[])],
+        #    "net_arch": [dict(pi=[128, 128], vf=[256, 128, 64])],
         #},
     )
 
 # 콜백 설정
-max_episodes = 6000  # 원하는 에피소드 수
+max_episodes = 8000  # 원하는 에피소드 수
 reward_logging_callback = RewardLoggingCallback(verbose=1)
 stop_callback = StopOnEpisodeCallback(max_episodes=max_episodes)
 callback = CallbackList([reward_logging_callback, stop_callback])

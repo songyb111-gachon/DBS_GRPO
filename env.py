@@ -316,7 +316,7 @@ class BinaryHologramEnv(gym.Env):
             reward += additional_reward
 
         # 성공 종료 조건: PSNR >= T_PSNR 또는 PSNR_DIFF >= T_PSNR_DIFF
-        terminated = self.psnr_sustained_steps >= self.T_steps and psnr_diff >= self.T_PSNR_DIFF
+        terminated = self.steps >= self.max_steps or self.psnr_sustained_steps >= self.T_steps
         truncated = self.steps >= self.max_steps
 
         return obs, reward, terminated, truncated, {}  # 빈 딕셔너리 반환
