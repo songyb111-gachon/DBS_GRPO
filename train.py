@@ -312,9 +312,9 @@ else:
         max_grad_norm=0.5,
         ent_coef=0.01,
         tensorboard_log="./ppo_MultiInputPolicy/",
-        policy_kwargs={
-            "net_arch": [dict(pi=[256,128,64,32], vf=[])],
-        },
+        #policy_kwargs={
+        #    "net_arch": [dict(pi=[256,128,64,32], vf=[])],
+        #},
     )
 
 # 콜백 설정
