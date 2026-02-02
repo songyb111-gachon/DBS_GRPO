@@ -35,5 +35,5 @@ git reset --hard 8e50d6a
 pip install tensorflow
 ```
 
-`log_py/tensorboard.py` 파일을 복사해서 
+`log_py/tensorboard.ipynd` 파일을 복사해서 
 `ppo_MultiInputPolicy/` 에서 원하는 로그 폴더에 붙여넣고 코드 돌리면 됨.
