@@ -207,10 +207,12 @@ class GRPOPolicy(nn.Module):
 
     def forward(self, x):
         """(B, in_ch, H, W) -> (B, CH*H*W) logits"""
-        return self.features(x).reshape(x.size(0), -1)
+        logits = self.features(x).reshape(x.size(0), -1)
+        return torch.clamp(logits, -20.0, 20.0)
 
     def get_distribution(self, x):
-        return torch.distributions.Categorical(logits=self.forward(x))
+        logits = self.forward(x)
+        return torch.distributions.Categorical(logits=logits)
 
 
 # ============================================================
@@ -349,21 +351,34 @@ class GRPOTrainer:
             ref_dist = self.ref_policy.get_distribution(obs_tensor)
             ref_log_probs = ref_dist.log_prob(actions_gpu).squeeze(-1)
 
-        # 4) 정책 업데이트 (다중 에폭)
+        # 4) 정책 업데이트 (다중 에폭, KL early stopping 포함)
         total_loss = 0.0
+        actual_epochs = 0
+        max_kl = 0.1  # KL이 이 값을 넘으면 조기 중단
+
         for _ in range(self.update_epochs):
             dist_new = self.policy.get_distribution(obs_tensor)
             new_log_probs = dist_new.log_prob(actions_gpu).squeeze(-1)
 
+            # NaN 감지 → 해당 에폭 스킵
+            if torch.isnan(new_log_probs).any():
+                break
+
             ratio = torch.exp(new_log_probs - old_lp_detached)
+            ratio = torch.clamp(ratio, 0.0, 10.0)  # ratio 폭주 방지
+
             surr1 = ratio * advantages
             surr2 = torch.clamp(ratio, 1.0 - self.clip_range,
                                 1.0 + self.clip_range) * advantages
             policy_loss = -torch.min(surr1, surr2).mean()
 
-            # KL(π_θ || π_ref) 근사: E_a[ exp(log(π_ref/π_θ)) - log(π_ref/π_θ) - 1 ]
             log_ratio_ref = ref_log_probs - new_log_probs
+            log_ratio_ref = torch.clamp(log_ratio_ref, -10.0, 10.0)
             kl_loss = (torch.exp(log_ratio_ref) - log_ratio_ref - 1.0).mean()
+
+            # KL이 너무 커지면 조기 중단 (정책이 너무 빨리 변하는 것 방지)
+            if kl_loss.item() > max_kl:
+                break
 
             loss = policy_loss + self.kl_coef * kl_loss
 
@@ -373,8 +388,9 @@ class GRPOTrainer:
             self.optimizer.step()
 
             total_loss += loss.item()
+            actual_epochs += 1
 
-        avg_loss = total_loss / self.update_epochs
+        avg_loss = total_loss / max(actual_epochs, 1)
 
         # 5) 최고 보상 액션 선택
         best_idx = int(np.argmax(rewards))
