@@ -363,6 +363,21 @@ def print_comparison(results_grpo, results_random, dataset_name=""):
 
     print(f"\n  [PSNR 향상 기준]  GRPO {psnr_grpo_wins}승  Random {psnr_random_wins}승  무승부 {psnr_ties}  (총 {n}장)")
     print(f"  [성공률 기준]     GRPO {sr_grpo_wins}승  Random {sr_random_wins}승  무승부 {sr_ties}  (총 {n}장)")
+
+    # 이미지별 승패 상세 리스트
+    print(f"\n  {'#':<5} {'PSNR↑ GRPO':>12} {'PSNR↑ Rand':>12} {'PSNR 승패':>8}  "
+          f"{'성공률 GRPO':>12} {'성공률 Rand':>12} {'성공률 승패':>10}")
+    print("  " + "-" * 85)
+
+    for i, (gi, ri) in enumerate(zip(g, r)):
+        psnr_win = "GRPO" if gi['psnr_diff'] > ri['psnr_diff'] else (
+                   "Rand" if gi['psnr_diff'] < ri['psnr_diff'] else "Draw")
+        sr_win = "GRPO" if gi['success_ratio'] > ri['success_ratio'] else (
+                 "Rand" if gi['success_ratio'] < ri['success_ratio'] else "Draw")
+
+        print(f"  {i+1:<5} {gi['psnr_diff']:>+12.4f} {ri['psnr_diff']:>+12.4f} {psnr_win:>8}  "
+              f"{gi['success_ratio']:>11.2%} {ri['success_ratio']:>12.2%} {sr_win:>10}")
+
     print("=" * 80)
 
 
@@ -456,21 +471,28 @@ def run_test_on_dataset(dataset_name, data_loader, hologram_model,
 
 
 if __name__ == '__main__':
-    # --- 설정 ---
-    MAX_STEPS = 1000                # 이미지당 DBS 스텝 수
-    GRPO_CHECKPOINT = "./grpo_models/grpo_latest.pt"
+    # ╔══════════════════════════════════════════════════════════╗
+    # ║                    여기만 수정하세요                      ║
+    # ╚══════════════════════════════════════════════════════════╝
+    GRPO_CHECKPOINT = "./grpo_models/grpo_latest.pt"   # GRPO 모델 경로
+    MAX_STEPS       = 1000                              # 이미지당 DBS 스텝 수
+    DATASET         = "both"                            # "train" / "valid" / "both"
+    NUM_IMAGES      = 0                                 # 데이터셋당 이미지 수 (0 = 전체)
+    TRAIN_DIR       = '/nfs/dataset/DIV2K/DIV2K_train_HR/DIV2K_train_HR/'
+    VALID_DIR       = '/nfs/dataset/DIV2K/DIV2K_valid_HR/DIV2K_valid_HR/'
+    # ════════════════════════════════════════════════════════════
 
-    target_dir = '/nfs/dataset/DIV2K/DIV2K_train_HR/DIV2K_train_HR/'
-    valid_dir = '/nfs/dataset/DIV2K/DIV2K_valid_HR/DIV2K_valid_HR/'
     meta = {'wl': 515e-9, 'dx': (7.56e-6, 7.56e-6)}
     padding = 0
 
-    # --- 데이터 ---
-    train_dataset = Dataset512(target_dir=target_dir, meta=meta, isTrain=False, padding=padding)
-    valid_dataset = Dataset512(target_dir=valid_dir, meta=meta, isTrain=False, padding=padding)
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
-    valid_loader = DataLoader(valid_dataset, batch_size=1, shuffle=False)
-    print(f"Train images: {len(train_dataset)},  Validation images: {len(valid_dataset)}")
+    print(f"\n{'=' * 60}")
+    print(f"  GRPO vs Random DBS 테스트 설정")
+    print(f"{'=' * 60}")
+    print(f"  Checkpoint:  {GRPO_CHECKPOINT}")
+    print(f"  Max Steps:   {MAX_STEPS}")
+    print(f"  Dataset:     {DATASET}")
+    print(f"  Num Images:  {'전체' if NUM_IMAGES == 0 else NUM_IMAGES}")
+    print(f"{'=' * 60}\n")
 
     # --- BinaryNet 로드 ---
     hologram_model = BinaryNet(
@@ -494,38 +516,55 @@ if __name__ == '__main__':
     result_dir = f"./test_results/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}/"
     os.makedirs(result_dir, exist_ok=True)
 
-    # ============================================================
-    # 1) Train 데이터셋 테스트
-    # ============================================================
-    train_grpo, train_random = run_test_on_dataset(
-        dataset_name="Train",
-        data_loader=train_loader,
-        hologram_model=hologram_model,
-        grpo_policy=grpo_policy,
-        max_steps=MAX_STEPS,
-        num_images=len(train_dataset),
-        result_dir=result_dir,
-    )
+    all_grpo = []
+    all_random = []
 
     # ============================================================
-    # 2) Validation 데이터셋 테스트
+    # Train 데이터셋 테스트
     # ============================================================
-    valid_grpo, valid_random = run_test_on_dataset(
-        dataset_name="Validation",
-        data_loader=valid_loader,
-        hologram_model=hologram_model,
-        grpo_policy=grpo_policy,
-        max_steps=MAX_STEPS,
-        num_images=len(valid_dataset),
-        result_dir=result_dir,
-    )
+    if DATASET in ("train", "both"):
+        train_dataset = Dataset512(target_dir=TRAIN_DIR, meta=meta, isTrain=False, padding=padding)
+        train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
+        n_train = len(train_dataset) if NUM_IMAGES == 0 else NUM_IMAGES
+        print(f"Train images: {len(train_dataset)} (testing {n_train})")
+
+        train_grpo, train_random = run_test_on_dataset(
+            dataset_name="Train",
+            data_loader=train_loader,
+            hologram_model=hologram_model,
+            grpo_policy=grpo_policy,
+            max_steps=MAX_STEPS,
+            num_images=n_train,
+            result_dir=result_dir,
+        )
+        all_grpo += train_grpo
+        all_random += train_random
 
     # ============================================================
-    # 3) Train + Validation 전체 종합 비교
+    # Validation 데이터셋 테스트
     # ============================================================
-    all_grpo = train_grpo + valid_grpo
-    all_random = train_random + valid_random
-    if all_grpo:
+    if DATASET in ("valid", "both"):
+        valid_dataset = Dataset512(target_dir=VALID_DIR, meta=meta, isTrain=False, padding=padding)
+        valid_loader = DataLoader(valid_dataset, batch_size=1, shuffle=False)
+        n_valid = len(valid_dataset) if NUM_IMAGES == 0 else NUM_IMAGES
+        print(f"Validation images: {len(valid_dataset)} (testing {n_valid})")
+
+        valid_grpo, valid_random = run_test_on_dataset(
+            dataset_name="Validation",
+            data_loader=valid_loader,
+            hologram_model=hologram_model,
+            grpo_policy=grpo_policy,
+            max_steps=MAX_STEPS,
+            num_images=n_valid,
+            result_dir=result_dir,
+        )
+        all_grpo += valid_grpo
+        all_random += valid_random
+
+    # ============================================================
+    # 전체 종합 비교
+    # ============================================================
+    if DATASET == "both" and all_grpo:
         print_comparison(all_grpo, all_random, "Train + Validation 전체")
 
     print(f"\nAll results saved to: {result_dir}")
