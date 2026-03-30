@@ -351,12 +351,18 @@ def print_comparison(results_grpo, results_random, dataset_name=""):
 
         print(f"  {name:<20} {g_str:>25}   {r_str:>25}   {d_str:>12}")
 
-    # 이미지별 승패
-    grpo_wins = sum(1 for gi, ri in zip(g, r) if gi['psnr_diff'] > ri['psnr_diff'])
-    random_wins = sum(1 for gi, ri in zip(g, r) if gi['psnr_diff'] < ri['psnr_diff'])
-    ties = n - grpo_wins - random_wins
+    # 이미지별 승패 — PSNR 향상 기준
+    psnr_grpo_wins = sum(1 for gi, ri in zip(g, r) if gi['psnr_diff'] > ri['psnr_diff'])
+    psnr_random_wins = sum(1 for gi, ri in zip(g, r) if gi['psnr_diff'] < ri['psnr_diff'])
+    psnr_ties = n - psnr_grpo_wins - psnr_random_wins
 
-    print(f"\n  승/패/무: GRPO {grpo_wins}승  Random {random_wins}승  무승부 {ties}  (총 {n}장)")
+    # 이미지별 승패 — 성공률 기준
+    sr_grpo_wins = sum(1 for gi, ri in zip(g, r) if gi['success_ratio'] > ri['success_ratio'])
+    sr_random_wins = sum(1 for gi, ri in zip(g, r) if gi['success_ratio'] < ri['success_ratio'])
+    sr_ties = n - sr_grpo_wins - sr_random_wins
+
+    print(f"\n  [PSNR 향상 기준]  GRPO {psnr_grpo_wins}승  Random {psnr_random_wins}승  무승부 {psnr_ties}  (총 {n}장)")
+    print(f"  [성공률 기준]     GRPO {sr_grpo_wins}승  Random {sr_random_wins}승  무승부 {sr_ties}  (총 {n}장)")
     print("=" * 80)
 
 
