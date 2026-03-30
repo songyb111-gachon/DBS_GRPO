@@ -261,6 +261,11 @@ class GRPOTrainer:
         self.optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
         self.episode_count = 0
 
+        # 실패 마스킹: 같은 상태에서 이미 시도하여 실패한 액션을 제외
+        self.num_pixels = CH * IPS * IPS
+        self.failed_mask = torch.zeros(self.num_pixels, device=device)
+        self._prev_state_hash = None
+
     # ----------------------------------------------------------
     # Observation → Tensor 변환
     # ----------------------------------------------------------
@@ -314,23 +319,32 @@ class GRPOTrainer:
     # ----------------------------------------------------------
     # GRPO 핵심 스텝
     # ----------------------------------------------------------
+    def _update_failed_mask(self, obs):
+        """상태가 바뀌면(= 성공적 플립) 실패 마스크 초기화"""
+        state_hash = obs['state'].tobytes()
+        if state_hash != self._prev_state_hash:
+            self.failed_mask.zero_()
+            self._prev_state_hash = state_hash
+
     def grpo_step(self, obs):
         """
-        1) π_old 에서 G개 액션 샘플링
+        1) π_old 에서 G개 액션 샘플링 (실패 마스킹 적용)
         2) 그룹 보상 평가
         3) 상대적 어드밴티지 = (r - mean) / std
         4) Clipped surrogate + KL(π_θ || π_ref) 로 정책 업데이트
         5) 그룹 내 최고 보상 액션 반환
         """
+        self._update_failed_mask(obs)
         obs_tensor = self.obs_to_tensor(obs)
 
-        # 1) 그룹 샘플링
+        # 1) 그룹 샘플링 (실패한 액션 마스킹)
         self.policy.eval()
         with torch.no_grad():
-            dist_old = self.policy.get_distribution(obs_tensor)
-            # (G, 1) → (G,)
-            actions = dist_old.sample((self.group_size,)).squeeze(-1)
-            old_log_probs = dist_old.log_prob(actions).squeeze(-1)
+            logits = self.policy(obs_tensor).squeeze(0)  # (CH*IPS*IPS,)
+            logits[self.failed_mask.bool()] = -1e9
+            masked_dist = torch.distributions.Categorical(logits=logits)
+            actions = masked_dist.sample((self.group_size,))  # (G,)
+            old_log_probs = masked_dist.log_prob(actions)     # (G,)
         self.policy.train()
 
         # 2) 보상 평가
@@ -347,9 +361,8 @@ class GRPOTrainer:
         old_lp_detached = old_log_probs.detach()
 
         # 레퍼런스 log prob (KL 계산용)
-        with torch.no_grad():
-            ref_dist = self.ref_policy.get_distribution(obs_tensor)
-            ref_log_probs = ref_dist.log_prob(actions_gpu).squeeze(-1)
+        ref_dist = self.ref_policy.get_distribution(obs_tensor)
+        ref_log_probs = ref_dist.log_prob(actions_gpu).squeeze(-1)
 
         # 4) 정책 업데이트 (다중 에폭, KL early stopping 포함)
         total_loss = 0.0
@@ -392,10 +405,14 @@ class GRPOTrainer:
 
         avg_loss = total_loss / max(actual_epochs, 1)
 
-        # 5) 최고 보상 액션 선택
+        # 5) 최고 보상 액션 선택 + 실패 액션 마스킹
         best_idx = int(np.argmax(rewards))
         best_action = actions[best_idx].item()
         best_reward = rewards[best_idx]
+
+        for i, r in enumerate(rewards):
+            if r <= 0:
+                self.failed_mask[actions[i].item()] = 1.0
 
         return best_action, best_reward, avg_loss
 
@@ -414,6 +431,10 @@ class GRPOTrainer:
             grpo_updates = 0
             last_loss = 0.0
 
+            # 에피소드 시작 시 마스크 초기화
+            self.failed_mask.zero_()
+            self._prev_state_hash = None
+
             while True:
                 step_count += 1
 
@@ -425,18 +446,25 @@ class GRPOTrainer:
                     if grpo_reward > 0:
                         obs, reward, terminated, truncated, _ = self.env.step(best_action)
                     else:
-                        # 그룹 내 양수 보상 액션 없음 → 정책에서 탐색적 샘플링
+                        # 그룹 내 양수 보상 액션 없음 → 마스킹된 분포에서 샘플링
                         obs_tensor = self.obs_to_tensor(obs)
                         with torch.no_grad():
-                            dist = self.policy.get_distribution(obs_tensor)
-                            action = dist.sample().squeeze().item()
+                            logits = self.policy(obs_tensor).squeeze(0)
+                            logits[self.failed_mask.bool()] = -1e9
+                            dist = torch.distributions.Categorical(logits=logits)
+                            action = dist.sample().item()
+                        self.failed_mask[action] = 1.0
                         obs, reward, terminated, truncated, _ = self.env.step(action)
                 else:
-                    # 업데이트 간격 사이: 현재 정책으로 행동 선택
+                    # 업데이트 간격 사이: 마스킹된 분포에서 행동 선택
+                    self._update_failed_mask(obs)
                     obs_tensor = self.obs_to_tensor(obs)
                     with torch.no_grad():
-                        dist = self.policy.get_distribution(obs_tensor)
-                        action = dist.sample().squeeze().item()
+                        logits = self.policy(obs_tensor).squeeze(0)
+                        logits[self.failed_mask.bool()] = -1e9
+                        dist = torch.distributions.Categorical(logits=logits)
+                        action = dist.sample().item()
+                    self.failed_mask[action] = 1.0
                     obs, reward, terminated, truncated, _ = self.env.step(action)
 
                 episode_reward += reward
