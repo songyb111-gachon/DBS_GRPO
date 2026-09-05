@@ -1,0 +1,3 @@
+[submodule "torchOptics"]
+	path = torchOptics
+	url = git@github.com:DHLabRepo/torchOptics.git

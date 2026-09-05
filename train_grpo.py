@@ -5,6 +5,8 @@ import os
 from utils.logger import setup_logger
 
 log_file = setup_logger()
+from utils.torchoptics_pin import assert_torchoptics_pinned
+assert_torchoptics_pinned()  # torchOptics 가 고정 커밋(8e50d6a)이 아니면 여기서 죽는다. 최신 torchOptics 는 사전학습 BinaryNet 을 깨뜨린다.
 logging.info("GRPO Training Script Initialized")
 
 import glob

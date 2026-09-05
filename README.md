@@ -21,14 +21,12 @@ cp -r "/home/songyb111/20260116/Direct-Binary-Search-Reinforcement-Learning/resu
 
 cp -r "/home/songyb111/20260116/Direct-Binary-Search-Reinforcement-Learning/dataset6" .
 
-git clone git@github.com:DHLabRepo/torchOptics.git
-
-cd torchOptics
-
-git reset --hard 8e50d6a
+git submodule update --init torchOptics
 
 .
 ```
+
+`torchOptics` 는 DHLabRepo/torchOptics 커밋 `8e50d6a` 에 고정된 서브모듈이다. 최신 torchOptics 에서는 사전학습 U-Net(BinaryNet)이 동작하지 않으므로 업데이트하지 말 것. 모든 실행 스크립트는 진입부에서 `utils/torchoptics_pin.py` 로 이 커밋을 검사하고, 다르면 즉시 에러로 멈춘다.
 
 학습 진행 결과를 보려면 아래를 터미널에 입력해서 설치한 뒤,
 ```

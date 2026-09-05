@@ -6,6 +6,8 @@ from utils.logger import setup_logger
 
 # 로거 설정
 log_file = setup_logger()
+from utils.torchoptics_pin import assert_torchoptics_pinned
+assert_torchoptics_pinned()  # torchOptics 가 고정 커밋(8e50d6a)이 아니면 여기서 죽는다. 최신 torchOptics 는 사전학습 BinaryNet 을 깨뜨린다.
 
 # 테스트 출력
 print("이 메시지는 콘솔과 파일에 동시에 기록됩니다.")
