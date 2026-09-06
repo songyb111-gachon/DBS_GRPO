@@ -42,6 +42,8 @@ v2 는 `train_grpo.py` 의 `CONFIG["trainer"] = "v2"` 로 켠다. 기본값은 `
 (d) 무작위 200 픽셀 + 오라클 최선/최악 각 8개의 ΔPSNR 을 브루트포스(실제 플립 후 시뮬레이션, **PSNR 은 float64 로 조립** — float32 PSNR 두 값의 차는 2e-6 dB 양자화 잡음을 갖는다)와 대조:
 오차 ≤ 5e-6 + 0.01·|기준| (전 표본), 부호 일치 100% (|기준| > 1e-5 dB 인 표본만, 제외가 과반이면 FAIL), 피어슨·스피어만 > 0.999, (e) 속도.
 한 픽셀 플립의 ΔPSNR 은 전형적으로 1e-4 dB 이므로 절대 허용오차 1e-4 같은 게이트는 틀린 오라클도 통과시킨다 — 그래서 상대 오차와 순위 상관을 본다.
+**서버 결과 (2026-09-06, torch 2.7.1+cu128, torchOptics 8e50d6a)**: 합성·실제 케이스 모두 ALL PASS. 실제 케이스(BinaryNet 초기 홀로그램, DIV2K 검증 1장, PSNR 24.225 dB): forward == `tt.simulate` 오차 0, 오라클 vs 브루트포스 최대 오차 1.1e-7 dB(216 플립, 허용 1.5e-5), 부호 일치 100%(209/216 대상), 스피어만 0.999999, 지도 1회 4.4 ms. 지도 통계: P_unif(ΔPSNR>0) 20.8%, E_unif[R] −2.0e-4 dB, E_unif[R⁺] +2.7e-5 dB, top-1 +1.44e-3 dB — 무작위 플립의 실현 이득 대비 최선 플립이 54배이고, 600스텝 × E_unif[R⁺] ≈ 0.016 dB 는 Random DBS 의 실측 +0.02 dB/600스텝(ANALYSIS.md)과 자릿수가 맞는다.
+
 **통과 전에는 v2 학습을 돌리지 않는다. 폴백은 없다** — 브루트포스 G 표본은 전체 지도 위에서만 정의되는 어드밴티지·검증 지표·상한 기준선을 줄 수 없어 "같은 인터페이스" 가 아니다. 실패하면 오라클을 고친다. 학습 시작 시에도 `startup_check` 가 첫 상태에서 8픽셀을 실제 시뮬레이션과 대조하고 불일치면 죽는다.
 
 ### 2.2 정책 입력과 구조
@@ -78,7 +80,7 @@ env.py 의 정의(max_steps, T_PSNR, T_PSNR_DIFF, num_samples), 광학 상수(`o
 
 | 단계 | 파일 | 게이트 | 상태 |
 |---|---|---|---|
-| 1. 오라클 | `grpo/oracle.py`, `grpo/oracle_selftest.py`, `grpo/oracle_algebra_check_np.py` | 로컬 numpy 대수 검증 / 서버 selftest ALL PASS | 로컬 PASS / 서버 **확인 필요** |
+| 1. 오라클 | `grpo/oracle.py`, `grpo/oracle_selftest.py`, `grpo/oracle_algebra_check_np.py` | 로컬 numpy 대수 검증 / 서버 selftest ALL PASS | 로컬 PASS / 서버 **PASS** (2026-09-06, §2.1 서버 결과) |
 | 2. 특징·정책 | `grpo/features.py`, `grpo/policies.py` | `grpo/smoke_v2.py` 형상·유한성 | 구현, 서버 **확인 필요** |
 | 3. 트레이너 v2 | `grpo/trainer_v2.py`, `grpo/dbs_state.py`, `train_grpo.py` CONFIG["v2"] | smoke 3조합(grpo/sample, grpo/policy, exact/uniform) + 체크포인트 저장·로드 | 구현, 서버 **확인 필요** |
 | 4. 평가 지원 | `grpo/eval_utils.py`, `eval_checkpoints.py`, `test_grpo.py` | v1 체크포인트 결과 불변, v2 로드, 오라클 탐욕 행 | 구현, `check_conventions.py` 66/66 |
