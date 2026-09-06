@@ -28,7 +28,8 @@ import torchvision
 import torchOptics.optics as tt
 import torchOptics.metrics as tm
 
-from env import BinaryHologramEnv
+# env.py(BinaryHologramEnv) 는 gymnasium/SB3 를 끌어온다. v1 학습 경로에서만 쓰므로 그 자리에서 import 한다 —
+# gymnasium 이 없는 서버에서도 v2 학습과 grpo/oracle_selftest.py(이 모듈을 import) 가 돌아야 한다.
 from optics_constants import OPTICS_META, PROP_Z   # 광학 상수 (의존성 없는 모듈; env.py 도 여기서 가져온다)
 from utils.overrides import (sweepable_names, collect_overrides, check_unread,
                              apply_overrides, flatten, axes_string, run_stamp)
@@ -377,7 +378,7 @@ class GRPOTrainer:
     def __init__(
         self,
         policy: GRPOPolicy,
-        env: BinaryHologramEnv,
+        env,                    # BinaryHologramEnv (v1 전용; 모듈 상단에서 import 하지 않는다)
         group_size: int = 16,
         sim_batch_size: int = 4,
         lr: float = 1e-4,
@@ -852,6 +853,7 @@ if __name__ == '__main__':
         raise SystemExit(0)
 
     # --- 환경 ---
+    from env import BinaryHologramEnv   # v1 전용 (gymnasium/SB3 필요). 없으면 여기서 ModuleNotFoundError 로 죽는다
     env = BinaryHologramEnv(
         target_function=hologram_model,
         trainloader=train_loader,

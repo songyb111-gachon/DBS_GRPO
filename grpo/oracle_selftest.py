@@ -78,8 +78,8 @@ def real_case(device):
     net.load_state_dict(torch.load(PRETRAINED, map_location=device))
     net.eval()
     with torch.no_grad():
-        h = (net(T) >= 0.5).float()[0]                   # (C,n,n)
-    return h, T[0, 0]
+        h = (net(T) >= 0.5).float()[0].as_subclass(torch.Tensor)   # (C,n,n); tt.Tensor 서브클래스를 벗긴다
+    return h, T[0, 0].as_subclass(torch.Tensor)
 
 
 def spearman(a, b):
