@@ -38,6 +38,8 @@ CONFIG = {
     "variant": "sweep",          # "sweep"(DBS.py 고전 DBS, 패스마다 순열·비복원) | "replacement"(평가 스크립트의 Random 기준선, 복원 추출)
     "max_trials": 2 * 524288,    # 총 시도 수 상한 (예: 524288 = 1 패스, 5 * 524288 = 5 패스)
     "seed": 0,
+    "accept_floor": 1e-6,        # 오라클 ΔPSNR 이 이보다 커야 "채택될 시도" 로 본다 (dB). 실제 DBS 의 채택 판정(재계산)은 float32 잡음 ≈1e-6 dB 를
+                                 # 가져서 그 아래 플립은 동전 던지기이고 PSNR 에는 기여하지 않는다. 0 이면 오라클 부호 그대로 (거절이 늘어 느려진다)
     "thresholds_db": (0.1, 0.5, 1.0, 2.0, 3.0, 5.0),   # 이 상승에 처음 닿은 시도·채택 수를 표로
     "log_every_accepted": 5000,  # 진행 출력 주기 (채택 플립 수)
     "csv_every_accepted": 100,   # CSV 기록 주기 (채택 플립 수)
@@ -54,13 +56,14 @@ def _fmt_hit(hit, th):
     return f"{hit[th][0]:>9,} / {hit[th][1]:>7,}" if th in hit else f"{'-':>9} / {'-':>7}"
 
 
-def random_curve(img, variant, max_trials, rng, thresholds, log_every, csv_every, label):
-    """반환 rows [(trials, accepted, psnr, gain, pos_frac)], hit {threshold: (trials, accepted)}, pass_gains [gain at end of pass]."""
+def random_curve(img, variant, max_trials, rng, thresholds, log_every, csv_every, label, floor):
+    """반환 rows [(trials, accepted, psnr, gain, pos_frac)], hit {threshold: (trials, accepted)}, pass_gains [gain at end of pass],
+    mismatches (오라클은 채택이라 했는데 재계산이 거절한 횟수 — 잡음 바닥 근처 플립)."""
     N = img.h.numel()
     rows, hit, pass_gains = [], {}, []
-    trials = accepted = 0
+    trials = accepted = mismatches = 0
     R = img.reward_map().reshape(-1)
-    pos = R > 0
+    pos = R > floor
 
     def record():
         rows.append((trials, accepted, img.psnr, img.gain, float(pos.float().mean())))
@@ -98,12 +101,21 @@ def random_curve(img, variant, max_trials, rng, thresholds, log_every, csv_every
             cand = torch.nonzero(pos, as_tuple=False).reshape(-1)
             a = int(cand[int(rng.integers(n_pos))])
             end_of_pass = False
+        r_pred = float(R[a])
         ok, _ = img.apply(a)
         if not ok:
-            raise RuntimeError(f"오라클이 개선(R>0)이라 한 픽셀 {a} 가 실제로 거절됨 - 오라클/상태 불일치, grpo/oracle_selftest.py 를 볼 것")
+            # 오라클 ΔPSNR 은 1e-7 dB 까지 맞지만 채택 판정은 재계산(float32 FFT) 이라 ≈1e-6 dB 잡음이 있다. 실제 DBS 도 이런 플립은
+            # 거절할 수 있으므로 "거절된 시도" 로 센다 (상태는 apply 가 복원했다). 큰 R 에서 거절되면 진짜 불일치 → 아래 상한에서 죽는다.
+            mismatches += 1
+            if mismatches <= 3 or r_pred > 1e-4:
+                print(f"    [{label}] 오라클 R={r_pred:+.2e} dB 인 픽셀 {a} 가 재계산에서 거절됨 (누적 {mismatches}회)")
+            if mismatches > 10 + 0.01 * accepted:
+                raise RuntimeError(f"오라클 채택 예측과 재계산 거절이 {mismatches}회 (채택 {accepted}회) - 잡음 바닥이 아니라 불일치, "
+                                   "grpo/oracle_selftest.py 를 볼 것")
+            continue
         accepted += 1
         R = img.reward_map().reshape(-1)
-        pos = R > 0
+        pos = R > floor
         for th in thresholds:
             if th not in hit and img.gain >= th:
                 hit[th] = (trials, accepted)
@@ -122,17 +134,19 @@ def random_curve(img, variant, max_trials, rng, thresholds, log_every, csv_every
             print(f"    [{label}] 채택 {accepted:>7,}  시도 {trials:>9,}  PSNR {img.psnr:.4f} ({img.gain:+.4f} dB)  "
                   f"개선비율 {float(pos.float().mean()):6.2%}  {rate:5.0f} 채택/s  경과 {el / 60:.1f}분 남은 {remaining}")
     record()
-    return rows, hit, pass_gains
+    if mismatches:
+        print(f"    [{label}] 잡음 바닥 근처 거절 {mismatches}회 (채택 {accepted:,}회의 {mismatches / max(accepted, 1):.2%})")
+    return rows, hit, pass_gains, mismatches
 
 
-def greedy_curve(img, steps, thresholds, csv_every, label):
+def greedy_curve(img, steps, thresholds, csv_every, label, floor):
     rows, hit = [], {}
     R = img.reward_map().reshape(-1)
-    rows.append((0, 0, img.psnr, img.gain, float((R > 0).float().mean())))
+    rows.append((0, 0, img.psnr, img.gain, float((R > floor).float().mean())))
     t0 = time.time()
     for s in range(1, steps + 1):
         a = int(torch.argmax(R))
-        if float(R[a]) <= 0:
+        if float(R[a]) <= floor:
             print(f"    [{label}] 개선 픽셀 0개 - 지역 최적 (스텝 {s - 1:,})")
             break
         ok, _ = img.apply(a)
@@ -143,11 +157,11 @@ def greedy_curve(img, steps, thresholds, csv_every, label):
             if th not in hit and img.gain >= th:
                 hit[th] = (s, s)
         if s % csv_every == 0:
-            rows.append((s, s, img.psnr, img.gain, float((R > 0).float().mean())))
+            rows.append((s, s, img.psnr, img.gain, float((R > floor).float().mean())))
         if s % 5000 == 0:
-            print(f"    [{label}] 스텝 {s:>7,}  PSNR {img.psnr:.4f} ({img.gain:+.4f} dB)  개선비율 {float((R > 0).float().mean()):6.2%}  "
+            print(f"    [{label}] 스텝 {s:>7,}  PSNR {img.psnr:.4f} ({img.gain:+.4f} dB)  개선비율 {float((R > floor).float().mean()):6.2%}  "
                   f"{s / (time.time() - t0):5.0f} 스텝/s")
-    rows.append((s, s, img.psnr, img.gain, float((R > 0).float().mean())))
+    rows.append((s, s, img.psnr, img.gain, float((R > floor).float().mean())))
     return rows, hit
 
 
@@ -176,11 +190,12 @@ def main():
         rng = np.random.default_rng(cfg["seed"])
         img = DBSImage(oracle, T, h0, name=name)
         R0 = img.reward_map().reshape(-1)
-        print(f"    초기 PSNR {img.psnr:.4f} dB, 개선 픽셀 {float((R0 > 0).float().mean()):.2%}, "
+        print(f"    초기 PSNR {img.psnr:.4f} dB, 개선 픽셀(R>{cfg['accept_floor']:g}) {float((R0 > cfg['accept_floor']).float().mean()):.2%}, "
               f"무작위 성공 1회당 기대 이득 {float(R0[R0 > 0].mean()):.3e} dB, top-1 {float(R0.max()):.3e} dB")
         t0 = time.time()
-        rows, hit, pass_gains = random_curve(img, cfg["variant"], cfg["max_trials"], rng, ths,
-                                             cfg["log_every_accepted"], cfg["csv_every_accepted"], f"{cfg['variant']}")
+        rows, hit, pass_gains, mism = random_curve(img, cfg["variant"], cfg["max_trials"], rng, ths,
+                                                   cfg["log_every_accepted"], cfg["csv_every_accepted"], f"{cfg['variant']}",
+                                                   cfg["accept_floor"])
         el = time.time() - t0
         csv_path = os.path.join(cfg["out_dir"], f"{cfg['variant']}_{os.path.splitext(name)[0]}.csv")
         write_csv(csv_path, rows)
@@ -196,10 +211,11 @@ def main():
         print(f"    {'상승 임계':>8}  {'시도':>9} / {'채택':>7}")
         for th in ths:
             print(f"    {th:>7.1f} dB  {_fmt_hit(hit, th)}")
-        row = {"name": name, "variant": cfg["variant"], "trials": last[0], "accepted": last[1], "gain": last[3], "hit": hit}
+        row = {"name": name, "variant": cfg["variant"], "trials": last[0], "accepted": last[1], "gain": last[3], "hit": hit,
+               "mismatches": mism}
         if cfg["include_oracle_greedy"]:
             g_img = DBSImage(oracle, T, h0, name=name)
-            g_rows, g_hit = greedy_curve(g_img, cfg["greedy_steps"], ths, cfg["csv_every_accepted"], "oracle_greedy")
+            g_rows, g_hit = greedy_curve(g_img, cfg["greedy_steps"], ths, cfg["csv_every_accepted"], "oracle_greedy", cfg["accept_floor"])
             write_csv(os.path.join(cfg["out_dir"], f"oracle_greedy_{os.path.splitext(name)[0]}.csv"), g_rows)
             gl = g_rows[-1]
             print(f"    오라클 탐욕 {gl[0]:,}스텝: PSNR {gl[2]:.4f} ({gl[3]:+.4f} dB), 개선 픽셀 {gl[4]:.2%}")
