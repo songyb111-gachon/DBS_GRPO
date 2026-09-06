@@ -496,8 +496,7 @@ def main():
     print("== 12. CONFIG['v2'] 키 <-> trainer_v2/train_grpo 참조 <-> grpo/smoke_v2.py cfg (손복사본) ==")
     src = read("train_grpo.py")
     blk = src[src.index('"v2": dict('):]
-    blk = blk[:blk.index("
-    ),")]
+    blk = blk[:blk.index("\n    ),")]
     v2_keys = set(re.findall(r"^\s+([a-z_]+)=", blk, re.M))
     tr = read("grpo/trainer_v2.py")
     used = set(re.findall(r'cfg\["([a-z_]+)"\]', tr)) | set(re.findall(r'v2\["([a-z_]+)"\]', src))
