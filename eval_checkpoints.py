@@ -299,6 +299,7 @@ if __name__ == '__main__':
                             #   같은 이미지로 고르고 보고하면 최고값이 위로 치우친다 -> 본 실험 보고는 select 로 고르고 report 로 보고한다
     SELECT_N   = 20         # EVAL_SPLIT 이 select/report 일 때의 경계 (NUM_EVAL_IMAGES 는 그 전에 적용)
     EVAL_SEEDS = None       # None: 지금처럼 시드 미고정 1회 | (0, 1, 2): 시드마다 전체를 반복해 평균과 시드 간 표준편차 열(±std)을 표·CSV 에 추가
+    CHECKPOINT_SELECT = None   # None: 폴더의 체크포인트 전부 | (4500, 12000, 24500): 이 반복(v1 은 에피소드) 번호만. 체크포인트 49개를 다 돌리면 이미지 10장×500스텝에도 1시간 가까이 든다
     # ════════════════════════════════════════════════════════════
 
     meta = {'wl': 515e-9, 'dx': (7.56e-6, 7.56e-6)}
@@ -371,6 +372,13 @@ if __name__ == '__main__':
     if not checkpoints:
         print(f"No checkpoints found in {MODEL_DIR}")
         sys.exit(1)
+    if CHECKPOINT_SELECT is not None:
+        wanted = set(int(x) for x in CHECKPOINT_SELECT)
+        missing = sorted(wanted - {e for e, _ in checkpoints})
+        if missing:
+            raise ValueError(f"CHECKPOINT_SELECT 에 없는 체크포인트: {missing} (있는 것: {[e for e, _ in checkpoints]})")
+        checkpoints = [(e, p) for e, p in checkpoints if e in wanted]
+        print(f"CHECKPOINT_SELECT: {len(checkpoints)}개만 평가 {sorted(wanted)}")
     print(f"Found {len(checkpoints)} checkpoints: ep{checkpoints[0][0]} ~ ep{checkpoints[-1][0]}")
 
     # --- 정책은 체크포인트마다 기록된 구성(policy_kind/feature_spec)으로 만든다. v1 은 레거시 GRPOPolicy ---

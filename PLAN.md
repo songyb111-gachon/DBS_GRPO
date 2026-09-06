@@ -106,6 +106,8 @@ env.py 의 정의(max_steps, T_PSNR, T_PSNR_DIFF, num_samples), 광학 상수(`o
 
 - **2026-09-07 검증 궤적** (`grpo/val_summary.py`, 98줄): 50→150 반복에서 정책이 균등(eff 3.5만)에서 약 10개 액션으로 붕괴하며 recovery 0.07→0.21; 150~1000 은 0.25 근처 정체; 1000→4900 은 완만히 상승해 0.33~0.37, 최고 0.399(it 4850). 아직 포화 아님. E_π[R] ≈ E_π[R⁺] 라 손해 보는 플립을 거의 고르지 않는다(P_π 95~99%). it 2850·3650 에 P_π 가 55%·70% 로 떨어졌다 50 반복 안에 회복 — 참조 대비 KL 2~5 nat 의 빠른 이동과 같은 현상. 다음: `eval_checkpoints.py`(Random·오라클 탐욕 포함) 로 DBS 루프 수준의 '이김' 판정.
 
+- **2026-09-07 본 런 1차 완료** (it 4500 재개 → 24500, 반복당 0.2 s): 검증 recovery 0.365 (it 4900 의 0.369 와 같음), P_π 99.97%, H 4.08 (eff 60), sat 0.023 — 2만 반복 추가로 회수율은 오르지 않았고 정책은 개선 픽셀 안에서 더 넓게 퍼졌을 뿐이다. 학습 상태 KL 4~6 nat, clipfrac 0.25~0.45, gn 13~42 (max_grad_norm 0.5 로 매 스텝 잘림). **현 체제의 정체 확정** → §6 의 새 런 묶음이 다음 단계.
+
 ## 6. 하이퍼파라미터 감사 (2026-09-07)
 
 네 관점(GRPO 원 논문 대조 / 문제 스케일 / 런 진단 / 코드 의미) 감사 + 반박 검증, 그리고 LLM 밖 GRPO 문헌 조사(DanceGRPO, Flow-GRPO, Mask-GRPO, STAGE, DiffusionNFT, Pref-GRPO, TempFlow-GRPO, DiverseGRPO, Discrete-Action-Space, Learning Without Critics(2511.03527), U-statistic(2603.01162), Dr.GRPO, DAPO, Entropy Mechanism)의 결론.
