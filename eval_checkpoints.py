@@ -31,6 +31,8 @@ import torchvision
 import torchOptics.optics as tt
 import torchOptics.metrics as tm
 
+from grpo.eval_utils import policy_input, load_policy_checkpoint, make_oracle_action_fn
+
 IPS = 256
 CH = 8
 warnings.filterwarnings('ignore')
@@ -171,13 +173,15 @@ def simulate_psnr(state, target_image, z=2e-3):
     binary = torch.tensor(state, dtype=torch.float32).cuda()
     binary = tt.Tensor(binary, meta={'dx': (7.56e-6, 7.56e-6), 'wl': 515e-9})
     with torch.no_grad():
-        sim = tt.simulate(binary, z).abs() ** 2
+        field = tt.simulate(binary, z)                 # (1, C, n, n) complex — v2 정책 특징·오라클 기준선용
+        sim = field.abs() ** 2
         result = torch.mean(sim, dim=1, keepdim=True)
         psnr = tt.relativeLoss(result, target_image, tm.get_PSNR)
-    return float(psnr), result
+    return float(psnr), result, field
 
 
-def make_grpo_action_fn(policy, device='cuda'):
+def make_grpo_action_fn(policy, device='cuda', spec="legacy", v2=False):
+    """spec: 체크포인트의 feature_spec. 'legacy' 는 v1 과 같은 26채널 입력, 'field' 는 복소 필드 특징 (grpo.eval_utils.policy_input)."""
     policy.eval()
     num_pixels = CH * IPS * IPS
     failed_mask = torch.zeros(num_pixels, device=device)
@@ -189,10 +193,7 @@ def make_grpo_action_fn(policy, device='cuda'):
             failed_mask.zero_()
             prev_state_hash[0] = state_bytes
 
-        parts = []
-        for key in ('state', 'state_record', 'pre_model', 'recon_image', 'target_image'):
-            parts.append(torch.as_tensor(obs[key], dtype=torch.float32))
-        x = torch.cat(parts, dim=1).to(device)
+        x = policy_input(obs, spec, device, v2=v2)
 
         with torch.no_grad():
             logits = policy(x).squeeze(0)
@@ -219,7 +220,7 @@ def run_dbs(state, pre_model, target_image, target_image_np,
     state = state.copy()
     state_record = np.zeros_like(state)
 
-    initial_psnr, recon = simulate_psnr(state, target_image)
+    initial_psnr, recon, field = simulate_psnr(state, target_image)
     current_psnr = initial_psnr
     recon_np = recon.cpu().numpy()
 
@@ -232,6 +233,8 @@ def run_dbs(state, pre_model, target_image, target_image_np,
             "pre_model": pre_model,
             "recon_image": recon_np,
             "target_image": target_image_np,
+            # v2 정책·오라클 기준선용 GPU 텐서. legacy 정책은 쓰지 않는다.
+            "recon_t": recon, "field": field, "target_t": target_image,
         }
 
         action = select_action_fn(obs)
@@ -239,10 +242,11 @@ def run_dbs(state, pre_model, target_image, target_image_np,
         row, col = divmod(px, IPS)
 
         state[0, ch, row, col] = 1 - state[0, ch, row, col]
-        psnr_after, recon_after = simulate_psnr(state, target_image)
+        psnr_after, recon_after, field_after = simulate_psnr(state, target_image)
 
         if psnr_after > current_psnr:
             current_psnr = psnr_after
+            recon, field = recon_after, field_after
             recon_np = recon_after.cpu().numpy()
             state_record[0, ch, row, col] += 1
             flip_count += 1
@@ -262,14 +266,13 @@ def run_dbs(state, pre_model, target_image, target_image_np,
 # 체크포인트 목록 수집
 # ============================================================
 def find_checkpoints(model_dir):
-    """grpo_ep*.pt 파일을 에피소드 순으로 정렬하여 반환"""
-    pattern = os.path.join(model_dir, "grpo_ep*.pt")
-    files = sorted(glob.glob(pattern))
+    """grpo_ep*.pt (v1, 에피소드) 와 grpo_v2_it*.pt (v2, 반복) 를 번호순으로 반환"""
+    files = sorted(glob.glob(os.path.join(model_dir, "grpo_ep*.pt")) + glob.glob(os.path.join(model_dir, "grpo_v2_it*.pt")))
 
     checkpoints = []
     for f in files:
         basename = os.path.basename(f)
-        match = re.search(r'grpo_ep(\d+)\.pt', basename)
+        match = re.search(r'grpo_(?:ep|v2_it)(\d+)\.pt', basename)   # v1: grpo_ep{N}, v2: grpo_v2_it{N}
         if match:
             ep = int(match.group(1))
             checkpoints.append((ep, f))
@@ -290,6 +293,12 @@ if __name__ == '__main__':
     NUM_EVAL_IMAGES = 10                                # 평가에 사용할 이미지 수 (0 = 전체)
     EVAL_DIR        = '/nfs/dataset/DIV2K/DIV2K_valid_HR/DIV2K_valid_HR/'  # 평가 데이터셋 경로
     INCLUDE_RANDOM_BASELINE = False   # True: 같은 이미지·스텝으로 Random DBS 를 1회 돌려 기준선 행을 표·CSV 에 추가 (episode=0, checkpoint=random_baseline)
+    INCLUDE_ORACLE_GREEDY   = False   # True: 오라클 탐욕 DBS(매 스텝 실제 최선 픽셀)를 상한 기준선으로 추가 (episode=-1, checkpoint=oracle_greedy). grpo/oracle_selftest.py 통과 후에만
+    BASELINE_NAMES = ("random_baseline", "oracle_greedy")
+    EVAL_SPLIT = "all"     # "all"(지금까지와 같음) | "select"(앞 SELECT_N 장: 체크포인트 고르기용) | "report"(나머지: 고른 체크포인트 보고용)
+                            #   같은 이미지로 고르고 보고하면 최고값이 위로 치우친다 -> 본 실험 보고는 select 로 고르고 report 로 보고한다
+    SELECT_N   = 20         # EVAL_SPLIT 이 select/report 일 때의 경계 (NUM_EVAL_IMAGES 는 그 전에 적용)
+    EVAL_SEEDS = None       # None: 지금처럼 시드 미고정 1회 | (0, 1, 2): 시드마다 전체를 반복해 평균과 시드 간 표준편차 열(±std)을 표·CSV 에 추가
     # ════════════════════════════════════════════════════════════
 
     meta = {'wl': 515e-9, 'dx': (7.56e-6, 7.56e-6)}
@@ -303,6 +312,10 @@ if __name__ == '__main__':
     print(f"  Eval Images:     {'전체' if NUM_EVAL_IMAGES == 0 else NUM_EVAL_IMAGES}")
     print(f"  Eval Data Dir:   {EVAL_DIR}")
     print(f"  Random Baseline: {INCLUDE_RANDOM_BASELINE}")
+    print(f"  Oracle Greedy:   {INCLUDE_ORACLE_GREEDY}")
+    if EVAL_SPLIT != "all" or EVAL_SEEDS is not None:
+        print(f"  Eval Split:      {EVAL_SPLIT} (SELECT_N={SELECT_N})")
+        print(f"  Eval Seeds:      {EVAL_SEEDS}")
     print(f"{'=' * 60}\n")
 
     # --- 데이터 ---
@@ -324,7 +337,15 @@ if __name__ == '__main__':
             "target_image_np": target_image.cpu().numpy(),
             "file_name": os.path.basename(file_path[0]),
         })
-    print(f"Eval images loaded: {len(eval_images)}")
+    if EVAL_SPLIT == "select":
+        eval_images = eval_images[:SELECT_N]
+    elif EVAL_SPLIT == "report":
+        eval_images = eval_images[SELECT_N:]
+    elif EVAL_SPLIT != "all":
+        raise ValueError(f"EVAL_SPLIT 은 all/select/report 중 하나: {EVAL_SPLIT!r}")
+    if not eval_images:
+        raise ValueError(f"평가 이미지가 0장 (EVAL_SPLIT={EVAL_SPLIT!r}, SELECT_N={SELECT_N}, NUM_EVAL_IMAGES={NUM_EVAL_IMAGES})")
+    print(f"Eval images loaded: {len(eval_images)}" + (f" (split={EVAL_SPLIT})" if EVAL_SPLIT != "all" else ""))
 
     # --- BinaryNet 로드 ---
     hologram_model = BinaryNet(
@@ -352,94 +373,82 @@ if __name__ == '__main__':
         sys.exit(1)
     print(f"Found {len(checkpoints)} checkpoints: ep{checkpoints[0][0]} ~ ep{checkpoints[-1][0]}")
 
-    # --- 정책 네트워크 (재사용) ---
-    grpo_policy = GRPOPolicy(num_channels=CH, img_size=IPS, mid_channels=64).cuda()
+    # --- 정책은 체크포인트마다 기록된 구성(policy_kind/feature_spec)으로 만든다. v1 은 레거시 GRPOPolicy ---
 
     # --- 체크포인트별 평가 ---
     all_results = []
 
+    seeds = [None] if EVAL_SEEDS is None else list(EVAL_SEEDS)
+    std_hdr = f"  {'±std(seed)':>10}" if EVAL_SEEDS is not None else ""
     print(f"\n{'━' * 90}")
-    print(f"  {'Checkpoint':<20} {'Episode':>8}  {'Avg PSNR↑':>10}  {'Avg Success%':>13}  "
+    print(f"  {'Checkpoint':<20} {'Episode':>8}  {'Avg PSNR↑':>10}{std_hdr}  {'Avg Success%':>13}  "
           f"{'Avg Flips':>10}  {'Time':>8}")
     print(f"{'━' * 90}")
 
+    def evaluate(make_action_fn):
+        """eval_images 전체를 시드마다 1회 돈다 (EVAL_SEEDS=None 이면 지금까지처럼 시드 미고정 1회).
+        반환: 시드 평균 지표, 시드 간 표준편차(psnr_diff_std; 1회면 0), 첫 시드의 이미지별 결과."""
+        per_seed = []
+        for sd in seeds:
+            if sd is not None:
+                np.random.seed(sd)
+                torch.manual_seed(sd)
+                torch.cuda.manual_seed_all(sd)
+            results = []
+            for img in eval_images:
+                torch.cuda.empty_cache()
+                results.append(run_dbs(
+                    state=img["initial_state"],
+                    pre_model=img["pre_model"],
+                    target_image=img["target_image"],
+                    target_image_np=img["target_image_np"],
+                    max_steps=MAX_STEPS,
+                    select_action_fn=make_action_fn(),
+                ))
+            per_seed.append(results)
+        diffs = [np.mean([r["psnr_diff"] for r in rs]) for rs in per_seed]
+        flat = [r for rs in per_seed for r in rs]
+        return {
+            "avg_psnr_diff": float(np.mean(diffs)),
+            "psnr_diff_std": float(np.std(diffs)) if len(diffs) > 1 else 0.0,
+            "avg_success_ratio": float(np.mean([r["success_ratio"] for r in flat])),
+            "avg_flip_count": float(np.mean([r["flip_count"] for r in flat])),
+            "per_image": per_seed[0],
+        }
+
+    def print_row(name, ep, res, elapsed):
+        std_col = f"  {res['psnr_diff_std']:>10.4f}" if EVAL_SEEDS is not None else ""
+        print(f"  {name:<20} {ep:>8}  "
+              f"{res['avg_psnr_diff']:>+10.4f}{std_col}  {res['avg_success_ratio']:>12.2%}  "
+              f"{res['avg_flip_count']:>10.1f}  {elapsed:>7.1f}s")
+
+    baselines = []
     if INCLUDE_RANDOM_BASELINE:
-        # Random DBS 기준선: 같은 이미지·같은 초기 홀로그램·같은 스텝 수로 1회. 시드는 고정하지 않는다.
+        baselines.append(("random_baseline", 0, make_random_action_fn))
+    if INCLUDE_ORACLE_GREEDY:
+        baselines.append(("oracle_greedy", -1, lambda: make_oracle_action_fn(CH, IPS)))
+    for bname, bep, bfn in baselines:
+        # 기준선: 같은 이미지·같은 초기 홀로그램·같은 스텝 수. 시드는 EVAL_SEEDS 가 없으면 고정하지 않는다.
         t_start = time.time()
-        base_results = []
-        for img in eval_images:
-            torch.cuda.empty_cache()
-            base_results.append(run_dbs(
-                state=img["initial_state"],
-                pre_model=img["pre_model"],
-                target_image=img["target_image"],
-                target_image_np=img["target_image_np"],
-                max_steps=MAX_STEPS,
-                select_action_fn=make_random_action_fn(),
-            ))
+        res = evaluate(bfn)
         elapsed = time.time() - t_start
-        all_results.append({
-            "episode": 0,
-            "checkpoint": "random_baseline",
-            "avg_psnr_diff": np.mean([r["psnr_diff"] for r in base_results]),
-            "avg_success_ratio": np.mean([r["success_ratio"] for r in base_results]),
-            "avg_flip_count": np.mean([r["flip_count"] for r in base_results]),
-            "time": elapsed,
-            "per_image": base_results,
-        })
-        b = all_results[-1]
-        print(f"  {'random_baseline':<20} {'-':>8}  "
-              f"{b['avg_psnr_diff']:>+10.4f}  {b['avg_success_ratio']:>12.2%}  "
-              f"{b['avg_flip_count']:>10.1f}  {elapsed:>7.1f}s")
+        all_results.append(dict(res, episode=bep, checkpoint=bname, time=elapsed))
+        print_row(bname, "-", res, elapsed)
 
     for ep_num, ckpt_path in checkpoints:
-        # 체크포인트 로드
-        ckpt = torch.load(ckpt_path, map_location='cuda')
-        grpo_policy.load_state_dict(ckpt['policy_state_dict'])
-        grpo_policy.eval()
-
-        ep_results = []
+        # 체크포인트 로드 — v1(policy_kind 없음)은 레거시 GRPOPolicy 로 예전과 똑같이, v2 는 기록된 policy_kind/feature_spec 으로
+        grpo_policy, policy_spec, pinfo = load_policy_checkpoint(ckpt_path, GRPOPolicy, CH, IPS)
         t_start = time.time()
-
-        for img in eval_images:
-            torch.cuda.empty_cache()
-            action_fn = make_grpo_action_fn(grpo_policy)
-
-            result = run_dbs(
-                state=img["initial_state"],
-                pre_model=img["pre_model"],
-                target_image=img["target_image"],
-                target_image_np=img["target_image_np"],
-                max_steps=MAX_STEPS,
-                select_action_fn=action_fn,
-            )
-            ep_results.append(result)
-
+        res = evaluate(lambda: make_grpo_action_fn(grpo_policy, spec=policy_spec, v2=pinfo["v2"]))
         elapsed = time.time() - t_start
-
-        avg_psnr_diff = np.mean([r["psnr_diff"] for r in ep_results])
-        avg_success = np.mean([r["success_ratio"] for r in ep_results])
-        avg_flips = np.mean([r["flip_count"] for r in ep_results])
-
-        all_results.append({
-            "episode": ep_num,
-            "checkpoint": ckpt_path,
-            "avg_psnr_diff": avg_psnr_diff,
-            "avg_success_ratio": avg_success,
-            "avg_flip_count": avg_flips,
-            "time": elapsed,
-            "per_image": ep_results,
-        })
-
-        print(f"  {os.path.basename(ckpt_path):<20} {ep_num:>8}  "
-              f"{avg_psnr_diff:>+10.4f}  {avg_success:>12.2%}  "
-              f"{avg_flips:>10.1f}  {elapsed:>7.1f}s")
+        all_results.append(dict(res, episode=ep_num, checkpoint=ckpt_path, time=elapsed))
+        print_row(os.path.basename(ckpt_path), ep_num, res, elapsed)
 
     # --- 최고 성능 체크포인트 ---
     print(f"\n{'━' * 90}")
 
     # '최고 체크포인트' 는 체크포인트끼리만 고른다. 기준선이 더 좋은 경우는 아래 기준선 대비 요약이 따로 말한다.
-    ckpt_rows = [r for r in all_results if r["checkpoint"] != "random_baseline"]
+    ckpt_rows = [r for r in all_results if r["checkpoint"] not in BASELINE_NAMES]
     best_psnr = max(ckpt_rows, key=lambda x: x["avg_psnr_diff"])
     best_success = max(ckpt_rows, key=lambda x: x["avg_success_ratio"])
 
@@ -466,7 +475,19 @@ if __name__ == '__main__':
             print(f"      ep{r['episode']:>5}: {wins}/{n_img}")
         if n_psnr == 0:
             print("    → 무처리(초기 홀로그램) 대비 개선이 있어도 Random DBS 대비 개선이 없으면 '학습/개선 안 됨' 으로 판정한다")
-        print("    (주의: 기준선·체크포인트 모두 시드 미고정 1회 실행 - 차이가 작으면 재실행으로 확인 필요)")
+        if EVAL_SEEDS is None:
+            print("    (주의: 기준선·체크포인트 모두 시드 미고정 1회 실행 - 차이가 작으면 EVAL_SEEDS 로 반복해 확인 필요)")
+        else:
+            print(f"    (시드 {len(seeds)}개 평균; ±std 열은 시드 간 표준편차)")
+
+    if INCLUDE_ORACLE_GREEDY:
+        orc = next(r for r in all_results if r["checkpoint"] == "oracle_greedy")
+        n_steps = max(1, len(eval_images) * MAX_STEPS * len(seeds))
+        print(f"\n  오라클 탐욕 상한 (PSNR↑ {orc['avg_psnr_diff']:+.4f} dB, 성공률 {orc['avg_success_ratio']:.2%}, "
+              f"{orc['time'] / n_steps * 1000:.1f} ms/스텝) 대비 회수율  (정책 행의 ms/스텝 = 정책 1회 + 시뮬레이션 1회):")
+        for r in ckpt_rows:
+            rec = r["avg_psnr_diff"] / orc["avg_psnr_diff"] if orc["avg_psnr_diff"] > 0 else float("nan")
+            print(f"      ep{r['episode']:>5}: {rec:.1%}   ({r['time'] / n_steps * 1000:.1f} ms/스텝)")
 
     # --- 결과 CSV 저장 ---
     result_dir = f"./eval_results/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}/"
@@ -474,10 +495,12 @@ if __name__ == '__main__':
 
     csv_path = os.path.join(result_dir, "checkpoint_comparison.csv")
     with open(csv_path, "w") as f:
-        f.write("episode,checkpoint,avg_psnr_diff,avg_success_ratio,avg_flip_count,time\n")
+        std_h = ",psnr_diff_std" if EVAL_SEEDS is not None else ""   # 시드 반복을 켰을 때만 열이 늘어난다 (기본 출력은 그대로)
+        f.write(f"episode,checkpoint,avg_psnr_diff{std_h},avg_success_ratio,avg_flip_count,time\n")
         for r in all_results:
+            std_v = f",{r['psnr_diff_std']:.6f}" if EVAL_SEEDS is not None else ""
             f.write(f"{r['episode']},{os.path.basename(r['checkpoint'])},"
-                    f"{r['avg_psnr_diff']:.6f},{r['avg_success_ratio']:.6f},"
+                    f"{r['avg_psnr_diff']:.6f}{std_v},{r['avg_success_ratio']:.6f},"
                     f"{r['avg_flip_count']:.1f},{r['time']:.2f}\n")
 
     detail_path = os.path.join(result_dir, "per_image_detail.csv")

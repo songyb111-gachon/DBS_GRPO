@@ -37,6 +37,9 @@ ENTRY_SCRIPTS = [
     "optimize_hyperparameter.py", "train_grpo.py", "test_grpo.py", "eval_checkpoints.py",
 ]
 GRPO_FILES = ["train_grpo.py", "test_grpo.py", "eval_checkpoints.py"]
+GRPO_PKG = ["grpo/oracle.py", "grpo/features.py", "grpo/policies.py", "grpo/dbs_state.py", "grpo/trainer_v2.py",
+            "grpo/eval_utils.py", "grpo/oracle_selftest.py", "grpo/smoke_v2.py"]
+GRPO_SCRIPTS = ["grpo/oracle_selftest.py", "grpo/smoke_v2.py"]   # torchOptics 를 쓰는 실행 스크립트 — 고정 커밋 검사가 먼저 와야 한다
 EVAL_FILES = ["test_grpo.py", "eval_checkpoints.py"]
 
 PRETRAINED_NAME = "2024-12-19 20:37:52.499731_pre_reinforce_8_0.002"
@@ -269,6 +272,13 @@ def main():
         i_to = idx(lambda l: l.startswith("import torchOptics"))
         cond = None not in (i_logger, i_pin, i_to) and i_logger < i_pin < i_to
         check(cond, f"{f}: setup_logger() -> assert_torchoptics_pinned() -> import torchOptics 순서")
+    for f in GRPO_SCRIPTS:
+        lines = read(f).splitlines()
+        i_pin = next((i for i, l in enumerate(lines) if l.strip().startswith("assert_torchoptics_pinned()")), None)
+        i_heavy = next((i for i, l in enumerate(lines)
+                        if l.startswith(("import torch", "from grpo", "from env", "import torchOptics", "from train_grpo"))), None)
+        check(i_pin is not None and (i_heavy is None or i_pin < i_heavy),
+              f"{f}: assert_torchoptics_pinned() 가 torch/grpo/env import 보다 앞")
 
     print("== 4. 손복사본 대조 (AST) ==")
     expect_variants("BinaryNet.__init__", ENTRY_SCRIPTS, 2,
@@ -289,17 +299,19 @@ def main():
         check(read(f).count(PRETRAINED_NAME) >= 2, f"{f}: '{PRETRAINED_NAME}' 폴더/파일 경로 사용")
 
     print("== 6. 광학 도메인 상수 (AST, 모든 파일) ==")
+    check("from optics_constants import OPTICS_META, PROP_Z" in read("env.py"),
+          "env.py 가 optics_constants 에서 OPTICS_META/PROP_Z 를 가져옴 (정의는 optics_constants.py 한 곳)")
     all_dx, all_wl, all_z = set(), set(), set()
-    for f in ENTRY_SCRIPTS + ["env.py"]:
+    for f in ENTRY_SCRIPTS + ["env.py", "optics_constants.py"] + GRPO_PKG:
         dx, wl, z, bad = collect_optics(read(f))
         all_dx.update(dx)
         all_wl.update(wl)
         all_z.update(z)
         check(not bad, f"{f}: meta/z 가 리터럴 또는 허용된 상수 이름, z 재할당 없음" + (f" - 위반 {bad}" if bad else ""))
         print(f"          {f}: dx {len(dx)}곳, wl {len(wl)}곳, z {len(z)}곳")
-        if f == "env.py":
+        if f == "optics_constants.py":
             check(len(dx) >= 1 and len(wl) >= 1 and len(z) >= 1,
-                  f"env.py 에 {OPTICS_CONST_NAME}(dx, wl)·{Z_CONST_NAME} 정의가 잡힘")
+                  f"optics_constants.py 에 {OPTICS_CONST_NAME}(dx, wl)·{Z_CONST_NAME} 정의가 잡힘")
     check(all_dx == {EXPECTED_DX}, f"모든 파일의 dx 값 집합 == {{{EXPECTED_DX}}} (실제 {all_dx})")
     check(all_wl == {EXPECTED_WL}, f"모든 파일의 wl 값 집합 == {{{EXPECTED_WL}}} (실제 {all_wl})")
     check(all_z == {EXPECTED_Z}, f"모든 파일의 z 값 집합 == {{{EXPECTED_Z}}} (실제 {all_z})")
@@ -384,6 +396,7 @@ def main():
         i_forced = bc.find("FORCED_KEYS", i_collect) if i_collect >= 0 else -1
         i_raise = bc.find("raise ValueError", i_forced) if i_forced >= 0 else -1
         check(0 <= i_collect < i_forced < i_raise, "build_config: 수집 -> 불변식 대조 -> raise ValueError 순서")
+        check("v1_only" in bc and "v2_keys" in bc, "build_config: 트레이너 전용 키 주입 가드(v1_only/v2_keys) 존재")
         a, b, c = axes_string({"lr": 1e-5}), axes_string({"lr": 3e-5}), axes_string({"lr": 1e-5, "seed": 0})
         check(len({a, b, c}) == 3, f"축이 다르면 산출물 이름이 다름 ({a} / {b} / {c})")
         has_branch = any(isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == "overrides"

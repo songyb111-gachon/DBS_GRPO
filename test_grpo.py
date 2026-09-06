@@ -31,6 +31,8 @@ import torchvision
 import torchOptics.optics as tt
 import torchOptics.metrics as tm
 
+from grpo.eval_utils import policy_input, load_policy_checkpoint, make_oracle_action_fn
+
 IPS = 256
 CH = 8
 warnings.filterwarnings('ignore')
@@ -175,10 +177,11 @@ def simulate_psnr(state, target_image, z=2e-3):
     binary = torch.tensor(state, dtype=torch.float32).cuda()
     binary = tt.Tensor(binary, meta={'dx': (7.56e-6, 7.56e-6), 'wl': 515e-9})
     with torch.no_grad():
-        sim = tt.simulate(binary, z).abs() ** 2
+        field = tt.simulate(binary, z)                 # (1, C, n, n) complex — v2 정책 특징·오라클 기준선용
+        sim = field.abs() ** 2
         result = torch.mean(sim, dim=1, keepdim=True)
         psnr = tt.relativeLoss(result, target_image, tm.get_PSNR)
-    return float(psnr), result
+    return float(psnr), result, field
 
 
 def run_dbs(state, pre_model, target_image, target_image_np,
@@ -191,7 +194,7 @@ def run_dbs(state, pre_model, target_image, target_image_np,
     state_record = np.zeros_like(state)
     num_pixels = CH * IPS * IPS
 
-    initial_psnr, recon = simulate_psnr(state, target_image)
+    initial_psnr, recon, field = simulate_psnr(state, target_image)
     current_psnr = initial_psnr
     recon_np = recon.cpu().numpy()
 
@@ -207,6 +210,8 @@ def run_dbs(state, pre_model, target_image, target_image_np,
             "pre_model": pre_model,
             "recon_image": recon_np,
             "target_image": target_image_np,
+            # v2 정책·오라클 기준선용 GPU 텐서. legacy 정책은 쓰지 않는다.
+            "recon_t": recon, "field": field, "target_t": target_image,
         }
 
         action = select_action_fn(obs)
@@ -216,10 +221,11 @@ def run_dbs(state, pre_model, target_image, target_image_np,
         # 플립
         state[0, ch, row, col] = 1 - state[0, ch, row, col]
 
-        psnr_after, recon_after = simulate_psnr(state, target_image)
+        psnr_after, recon_after, field_after = simulate_psnr(state, target_image)
 
         if psnr_after > current_psnr:
             current_psnr = psnr_after
+            recon, field = recon_after, field_after
             recon_np = recon_after.cpu().numpy()
             state_record[0, ch, row, col] += 1
             flip_count += 1
@@ -255,7 +261,7 @@ def make_random_action_fn():
     return select
 
 
-def make_grpo_action_fn(policy, device='cuda', temperature=1.0):
+def make_grpo_action_fn(policy, device='cuda', temperature=1.0, spec="legacy", v2=False):
     """
     GRPO 정책 기반 액션 선택.
     확률적 샘플링 + 실패 마스킹으로 같은 나쁜 픽셀 반복 방지.
@@ -271,10 +277,7 @@ def make_grpo_action_fn(policy, device='cuda', temperature=1.0):
             failed_mask.zero_()
             prev_state_hash[0] = state_bytes
 
-        parts = []
-        for key in ('state', 'state_record', 'pre_model', 'recon_image', 'target_image'):
-            parts.append(torch.as_tensor(obs[key], dtype=torch.float32))
-        x = torch.cat(parts, dim=1).to(device)
+        x = policy_input(obs, spec, device, v2=v2)   # spec='legacy' 면 v1 과 같은 26채널 concat (v2 학습분은 state_record=0)
 
         with torch.no_grad():
             logits = policy(x).squeeze(0)  # (CH*IPS*IPS,)
@@ -388,7 +391,7 @@ def print_comparison(results_grpo, results_random, dataset_name=""):
 # ============================================================
 def run_test_on_dataset(dataset_name, data_loader, hologram_model,
                         grpo_policy, max_steps, num_images, result_dir,
-                        temperature=1.0):
+                        temperature=1.0, policy_spec="legacy", policy_v2=False):
     """단일 데이터셋에 대해 GRPO vs Random DBS 비교 실행"""
     results_grpo = []
     results_random = []
@@ -421,7 +424,7 @@ def run_test_on_dataset(dataset_name, data_loader, hologram_model,
         initial_state = (pre_model >= 0.5).astype(np.int8)
 
         # 이미지마다 새 액션 함수 생성 (실패 마스크 초기화)
-        grpo_action_fn = make_grpo_action_fn(grpo_policy, temperature=temperature)
+        grpo_action_fn = make_grpo_action_fn(grpo_policy, temperature=temperature, spec=policy_spec, v2=policy_v2)
         random_action_fn = make_random_action_fn()
 
         # GRPO DBS
@@ -511,11 +514,9 @@ if __name__ == '__main__':
     hologram_model.eval()
 
     # --- GRPO 정책 로드 ---
-    grpo_policy = GRPOPolicy(num_channels=CH, img_size=IPS, mid_channels=64).cuda()
-    ckpt = torch.load(GRPO_CHECKPOINT, map_location='cuda')
-    grpo_policy.load_state_dict(ckpt['policy_state_dict'])
-    grpo_policy.eval()
-    print(f"GRPO checkpoint loaded: {GRPO_CHECKPOINT} (episode {ckpt['episode_count']})")
+    # v1(policy_kind 없음)은 레거시 GRPOPolicy 로 예전과 똑같이, v2 는 기록된 policy_kind/feature_spec 으로 구성
+    grpo_policy, policy_spec, pinfo = load_policy_checkpoint(GRPO_CHECKPOINT, GRPOPolicy, CH, IPS)
+    print(f"GRPO checkpoint loaded: {GRPO_CHECKPOINT} ({pinfo['kind']}, feature_spec={policy_spec}, step {pinfo['step']})")
 
     result_dir = f"./test_results/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}/"
     os.makedirs(result_dir, exist_ok=True)
@@ -537,6 +538,8 @@ if __name__ == '__main__':
             data_loader=train_loader,
             hologram_model=hologram_model,
             grpo_policy=grpo_policy,
+            policy_spec=policy_spec,
+            policy_v2=pinfo["v2"],
             max_steps=MAX_STEPS,
             num_images=n_train,
             result_dir=result_dir,
@@ -558,6 +561,8 @@ if __name__ == '__main__':
             data_loader=valid_loader,
             hologram_model=hologram_model,
             grpo_policy=grpo_policy,
+            policy_spec=policy_spec,
+            policy_v2=pinfo["v2"],
             max_steps=MAX_STEPS,
             num_images=n_valid,
             result_dir=result_dir,

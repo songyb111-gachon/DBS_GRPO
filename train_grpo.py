@@ -28,7 +28,8 @@ import torchvision
 import torchOptics.optics as tt
 import torchOptics.metrics as tm
 
-from env import BinaryHologramEnv, OPTICS_META, PROP_Z   # 광학 상수는 env.py 한 곳에서만 정의한다
+from env import BinaryHologramEnv
+from optics_constants import OPTICS_META, PROP_Z   # 광학 상수 (의존성 없는 모듈; env.py 도 여기서 가져온다)
 from utils.overrides import (sweepable_names, collect_overrides, check_unread,
                              apply_overrides, flatten, axes_string, run_stamp)
 import json
@@ -76,6 +77,36 @@ CONFIG = {
                                 # False: ep2800 까지 돌린 기존 런과 같은 동작 (첫 epoch 에도 ratio = 1 - 마스크된 확률질량)
     "seed": None,               # None: 비고정 (기존 동작). 정수(예: 0)면 random/numpy/torch 시드 고정.
                                 # 재개(resume) 시에는 시드가 다시 처음부터 적용돼 데이터 순서가 첫 런과 같아진다 — 재현용이지 이어달리기용이 아님
+    # --- 학습 구조 (PLAN.md). "v1" = 기존 GRPO(상태당 16샘플을 각각 시뮬레이션). "v2" = 오라클 보상 + 배치 GRPO ---
+    "trainer": "v1",            # "v1" | "v2".  v2 로 켜면 save_dir 이 grpo_models_v2_<policy_kind>/ 로 바뀐다
+    "v2": dict(
+        policy_kind="unet",         # "fcn"(v1 과 같은 5층 3x3, 수용 영역 9px) | "unet"(4단, 기본 후보) | "fno"(공유 스펙트럼 필터: PSF 회귀에 가까움, 학습 속도 비교 arm)
+        feature_spec="field",       # "legacy"(26ch, v1 관측; v2 에서는 state_record 채널이 항상 0) | "field"(51ch: 복소 필드·오차·곱 특징)
+        state_gate=True,            # 로짓 = h·L1 + (1-h)·L0 로 상태가 고른다 (fno 는 필수, unet/fcn 은 보조). 관측 h 를 쓰므로 답 누설 아님
+        objective="grpo",           # "grpo" | "exact"(진단: Σπ(a)A(a) 직접 최대화 — GRPO 가 아니며 그 결과를 GRPO 로 보고하지 않는다)
+        reward_transform="relu",    # "relu"(max(R,0): DBS 가 실제로 실현하는 스텝 이득 = 평가 지표와 같은 함수) | "raw"(비교 arm)
+        adv_baseline="sample",      # "sample"(G 표본 통계 = DeepSeek GRPO 그대로) | "policy"(π_old 가중 모집단, G→∞ 극한) | "uniform"(균등 모집단)
+        images_per_batch=8,         # K: 동시에 굴리는 이미지 수 (예: 4, 8, 16). 표본은 공짜지만 유효표본 수는 K 가 정한다
+        group_size=64,              # G: 상태당 정책 샘플 수 (예: 16, 64, 128)
+        steps_per_image=200,        # 이미지당 DBS 스텝 뒤 새 이미지로 교체 (예: 200, 600)
+        update_epochs=2,            # 반복당 epoch
+        minibatch_states=4,         # 미니배치에 넣는 상태 수 (GPU 메모리에 맞게)
+        lr=3e-4,
+        clip_range=0.2,
+        kl_coef=0.04,
+        max_grad_norm=0.5,
+        ref_update_iters=50,        # π_ref 갱신 주기(반복). 0 = 고정 참조(초기 정책 = 엔트로피 정규화 해석). v1 과 같은 이동 참조가 기본
+        entropy_coef=0.0,           # 엔트로피 보너스. A 가 z-score 라 0.01 이하는 거의 무의미 (예: 0, 0.05, 0.2)
+        advance="best",             # 상태 전진: "best"(G 개 중 R>0 최고) | "sample"(정책 샘플 1개 — 시험 시와 같은 분포)
+        num_iters=20000,            # 이번 실행에서 추가로 도는 반복 수 (재개 시 누적 아님)
+        val_images=8,               # 고정 검증 상태 수 V (검증 이미지 앞 V 장; 뒤 절반은 val_advance_steps 만큼 진행한 '중반 상태')
+        val_advance_steps=100,      # 검증 상태 절반을 무작위-채택 DBS 로 이만큼 진행
+        val_every=50,
+        save_every=500,
+        startup_check=True,         # 시작 시 첫 상태에서 오라클 vs 실제 시뮬레이션 8픽셀 대조. 불일치면 죽는다 (폴백 없음)
+        unet_base=32,               # unet 폭 (예: 16, 32)
+        fno_hidden=16,              # fno 트렁크 폭
+    ),
     # --- 실행 ---
     "num_episodes": 8000,
     "save_dir": "./grpo_models/",   # 파일 스위치를 켜면 접미사가 붙는다: mask_in_update → _maskfix, seed → _seed{N}.
@@ -119,6 +150,18 @@ def build_config(injected):
     check_unread(injected, names, SWEEP_PREFIX)            # 접두사 붙은 오타는 여기서 멈춘다
     file_values = flatten(CONFIG)
     overrides, shadowed = collect_overrides(injected, names, file_values)   # 적용은 아직
+
+    # 트레이너 전용 키 가드: v1 전용 키를 v2 런에(또는 v2.* 를 v1 런에) 주입하면 폴더 이름에는 들어가는데 학습은 안 읽는다
+    # — '스윕 축이 조용히 무시되는' 사고. 목록은 손으로 두지 않고 CONFIG 에서 만든다.
+    trainer = overrides.get("trainer", file_values["trainer"])
+    v2_keys = {k for k in file_values if k.startswith("v2.")}
+    shared = {"train_dir", "valid_dir", "padding", "batch_size", "pretrained_path", "mid_channels", "seed",
+              "trainer", "save_dir", "resume_training"}
+    v1_only = {k for k in file_values if k not in v2_keys and k not in shared}
+    wrong = sorted(k for k in overrides if (trainer == "v2" and k in v1_only) or (trainer != "v2" and k in v2_keys))
+    if wrong:
+        raise ValueError(f"trainer={trainer!r} 런에서 읽히지 않는 키가 주입됐습니다: {wrong}. "
+                         "v2 는 v2.* 키만, v1 은 최상위 키만 읽습니다 (공유 키: " + ", ".join(sorted(shared)) + ").")
 
     # 불변식: 값은 CONFIG 의 것 그대로. 주입이 다른 값을 주면 조용히 덮지 않고 멈춘다.
     clash = {k: overrides[k] for k in FORCED_KEYS if k in overrides and overrides[k] != file_values[k]}
@@ -675,7 +718,8 @@ if __name__ == '__main__':
     # --- 저장 경로: 어느 설정의 산출물인지 이름만 보고 알 수 있어야 하고, 켰을 때만 이름이 바뀌어야 한다 ---
     # 파일에서 켠 스위치는 접미사로 붙인다 (주입으로 켠 것은 아래 sweep 이름의 축에 이미 들어간다).
     switch_suffix = (("_maskfix" if cfg["mask_in_update"] and "mask_in_update" not in overrides else "")
-                     + (f"_seed{cfg['seed']}" if cfg["seed"] is not None and "seed" not in overrides else ""))
+                     + (f"_seed{cfg['seed']}" if cfg["seed"] is not None and "seed" not in overrides else "")
+                     + (f"_v2_{cfg['v2']['policy_kind']}" if cfg["trainer"] == "v2" and "trainer" not in overrides else ""))
     base_dir = cfg["save_dir"].rstrip("/\\") + switch_suffix
     if "save_dir" in overrides:
         # 앞 셀이 save_dir 을 직접 준 경우 — 스윕 arm 을 이어서 돌릴 때 쓴다. 그대로 쓴다.
@@ -692,19 +736,20 @@ if __name__ == '__main__':
         save_dir = f"{base_dir}/"
         chosen = "파일 CONFIG 기준" + (f" (스위치 접미사 {switch_suffix})" if switch_suffix else " (기존 런과 같은 폴더)")
         os.makedirs(save_dir, exist_ok=True)
-    checkpoint_path = os.path.join(save_dir, "grpo_latest.pt")
+    checkpoint_path = os.path.join(save_dir, "grpo_v2_latest.pt" if cfg["trainer"] == "v2" else "grpo_latest.pt")
     overrides_path = os.path.join(save_dir, "overrides.json")
     print(f"[GRPO] save_dir = {save_dir}   <- {chosen}")
 
     # 이어달리기 안전장치: 이 폴더의 직전 실행 설정(overrides.json)과 지금 설정이 다르면 멈춘다.
     # 다른 설정의 체크포인트를 조용히 이어받아 원래 이름으로 기록하는 사고를 막는다. 이어달리며 바꿔도 되는 키만 예외.
-    RESUME_MUTABLE = {"num_episodes", "save_interval", "resume_training", "save_dir"}
+    RESUME_MUTABLE = {"num_episodes", "save_interval", "resume_training", "save_dir",
+                      "v2.num_iters", "v2.save_every", "v2.val_every"}   # 실행 길이·주기만 — 학습 결과에 영향 없는 키
     if cfg["resume_training"] and os.path.exists(checkpoint_path) and os.path.exists(overrides_path):
         with open(overrides_path, encoding="utf-8") as f:
             prev = json.load(f).get("effective_config", {})
         now_flat, prev_flat = flatten(cfg), flatten(prev)
         diffs = {k: (prev_flat[k], v) for k, v in now_flat.items()
-                 if k.split(".")[0] not in RESUME_MUTABLE and k in prev_flat and prev_flat[k] != v}
+                 if k not in RESUME_MUTABLE and k.split(".")[0] not in RESUME_MUTABLE and k in prev_flat and prev_flat[k] != v}
         if diffs:
             raise ValueError(
                 "설정이 다른 채로 이 폴더의 체크포인트를 이어받으려 합니다: "
@@ -732,6 +777,79 @@ if __name__ == '__main__':
     ).cuda()
     hologram_model.load_state_dict(torch.load(cfg["pretrained_path"]))
     hologram_model.eval()
+
+    # ============================================================
+    # v2: 오라클 보상 + 배치 GRPO (PLAN.md). env.py 의 에피소드/임계 정의는 쓰지 않는다 (평가 프로토콜은 그대로).
+    # ============================================================
+    if cfg["trainer"] == "v2":
+        from grpo.oracle import FlipOracle
+        from grpo.features import num_channels
+        from grpo.policies import make_policy, count_params
+        from grpo.dbs_state import DBSImage
+        from grpo.trainer_v2 import GRPOTrainerV2
+
+        v2 = cfg["v2"]
+        device = torch.device("cuda")
+        oracle = FlipOracle(OPTICS_META, PROP_Z, IPS, CH, device=device)
+
+        def _prep(T, path):
+            # Dataset512 는 tt.Tensor(meta 포함) 를 준다. 먼저 벗기지 않으면 pre/h0/U/특징/액션/보상이 전부 서브클래스가 되고
+            # 0-차원 서브클래스 텐서는 f-string 포맷에서 TypeError 로 죽는다 (smoke 는 plain 텐서만 써서 이 경로를 못 본다)
+            T = T.to(device).as_subclass(torch.Tensor)
+            with torch.no_grad():
+                pre = hologram_model(T)[0]                       # (C, n, n) 사전학습 확률
+            return T[0, 0], (pre >= 0.5).float(), pre, os.path.basename(path[0])
+
+        _train_iter = [iter(train_loader)]
+
+        def new_image():
+            try:
+                T, path = next(_train_iter[0])
+            except StopIteration:
+                _train_iter[0] = iter(train_loader)
+                T, path = next(_train_iter[0])
+            return _prep(T, path)
+
+        # 검증 상태: 검증 이미지 앞 V 장의 초기 홀로그램. 뒤 절반은 무작위-채택 DBS 로 val_advance_steps 진행한 '중반 상태'.
+        val_states = []
+        _val_iter = iter(valid_loader)
+        _val_rng = np.random.default_rng(0)
+        for i in range(v2["val_images"]):
+            T, path = next(_val_iter)
+            Tv, h0, pre, name = _prep(T, path)
+            s = DBSImage(oracle, Tv, h0, name=name)
+            s.pre_model = pre
+            if i >= v2["val_images"] // 2 and v2["val_advance_steps"] > 0:
+                s.random_accept_steps(v2["val_advance_steps"], _val_rng)
+            val_states.append(s)
+        print(f"[v2] val states: {len(val_states)} (뒤 {len(val_states) - v2['val_images'] // 2}개는 {v2['val_advance_steps']}스텝 진행 상태)")
+
+        in_ch = num_channels(v2["feature_spec"], CH)
+        policy = make_policy(v2["policy_kind"], in_ch, CH, IPS, feature_spec=v2["feature_spec"], state_gate=v2["state_gate"],
+                             mid_channels=cfg["mid_channels"], unet_base=v2["unet_base"], fno_hidden=v2["fno_hidden"])
+        print(f"[v2] policy={v2['policy_kind']} feature_spec={v2['feature_spec']} state_gate={v2['state_gate']} "
+              f"in_ch={in_ch} params={count_params(policy):,}")
+        trainer = GRPOTrainerV2(policy, oracle, v2, feature_spec=v2["feature_spec"], new_image_fn=new_image,
+                                val_states=val_states, device=device, log_dir=save_dir)
+        trainer.extra_meta = {"policy_kind": v2["policy_kind"], "feature_spec": v2["feature_spec"],
+                              "in_channels": in_ch, "state_gate": v2["state_gate"], "config": cfg}
+        if v2["startup_check"]:
+            from grpo.oracle import startup_consistency_check
+            startup_consistency_check(oracle, trainer.images[0].h, trainer.images[0].T)
+        resume_from = checkpoint_path if (cfg["resume_training"] and os.path.exists(checkpoint_path)) else None
+        if cfg["resume_training"] and resume_from is None:
+            print(f"Warning: No checkpoint at {checkpoint_path}. Training from scratch.")
+        if resume_from:
+            trainer.load_checkpoint(resume_from)
+        record = {"overrides": overrides, "effective_config": cfg, "save_dir": save_dir,
+                  "resumed_from_episode": trainer.iteration if resume_from else None, "log_file": log_file,
+                  "written_at": datetime.now().isoformat(timespec="seconds")}
+        with open(overrides_path, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2, default=str)
+        with open(os.path.join(save_dir, "overrides_history.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        trainer.train(num_iters=v2["num_iters"], save_dir=save_dir, save_every=v2["save_every"], val_every=v2["val_every"])
+        raise SystemExit(0)
 
     # --- 환경 ---
     env = BinaryHologramEnv(

@@ -28,10 +28,9 @@ IPS = 256  #이미지 픽셀 사이즈
 CH = 8  #채널
 RW = 800  #보상
 
-# 광학 도메인 상수 — 물리 장치가 정하는 값이라 튜닝 대상이 아니다. 이 저장소의 모든 시뮬레이션 지점이 이 값을 쓴다
-# (train_grpo.py 는 여기서 import; test_grpo.py/eval_checkpoints.py/DBS.py 의 리터럴은 check_conventions.py 가 같은 값인지 대조한다).
-OPTICS_META = {'dx': (7.56e-6, 7.56e-6), 'wl': 515e-9}   # 픽셀 피치 7.56 um, 파장 515 nm
-PROP_Z = 2e-3                                            # 전파 거리 2 mm
+# 광학 도메인 상수 — 물리 장치가 정하는 값이라 튜닝 대상이 아니다. 정의는 optics_constants.py (의존성 없는 모듈) 한 곳뿐이고
+# 이 파일과 grpo/ 는 거기서 가져온다. test_grpo.py/eval_checkpoints.py/DBS.py 의 리터럴은 check_conventions.py 가 같은 값인지 대조한다.
+from optics_constants import OPTICS_META, PROP_Z
 
 warnings.filterwarnings('ignore')
 
