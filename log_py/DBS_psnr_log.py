@@ -48,14 +48,14 @@ def extract_dataset_steps(file_path, channel, image_size):
             final_step = channel * image_size * image_size
             final_step_match = re.search(
                 rf"Step: {final_step}\s+"
-                r"PSNR Before: [\d.]+\s+\|\s+PSNR After: [\d.]+\s+\|\s+Change: ([\d.e+-]+).*?"
+                r"PSNR Before: [\d.]+\s+\|\s+PSNR After: [\d.]+\s+\|\s+Change: [\d.e+-]+\s+\|\s+Diff: ([\d.e+-]+).*?"
                 r"Success Ratio: ([\d.e+-]+)\s+\|\s+Flip Count: (\d+).*?"
                 r"Time taken for this data: ([\d.]+) seconds",
                 dataset_content,
                 re.DOTALL,
             )
             if final_step_match:
-                psnr_diff = float(final_step_match.group(1))  # 마지막 스텝에서는 Change를 Diff로 사용
+                psnr_diff = float(final_step_match.group(1))  # 마지막 스텝도 Diff(총 개선량). Change 는 마지막 임계 통과 시점의 단일 플립 변화량이라 총 개선량이 아니다
                 success_ratio = float(final_step_match.group(2))
                 flip_count = int(final_step_match.group(3))
                 time_taken = float(final_step_match.group(4))

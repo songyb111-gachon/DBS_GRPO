@@ -284,6 +284,7 @@ import optuna
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import VecNormalize
+from stable_baselines3.common.evaluation import evaluate_policy
 
 def optimize_hyperparameters(env, n_trials=1000, n_timesteps=10000):
     def objective(trial):
@@ -300,9 +301,6 @@ def optimize_hyperparameters(env, n_trials=1000, n_timesteps=10000):
         vf_coef = trial.suggest_float("vf_coef", 0.1, 1.0)
         ent_coef = trial.suggest_float("ent_coef", 0.0, 0.05)
         max_grad_norm = trial.suggest_float("max_grad_norm", 0.3, 1.0)
-        net_arch_pi = trial.suggest_categorical("net_arch_pi", [[64, 64], [128, 128], [256, 128]])
-        net_arch_vf = trial.suggest_categorical("net_arch_vf", [[64, 64], [128, 128], [256, 128]])
-        policy_kwargs = {"net_arch": [dict(pi=net_arch_pi, vf=net_arch_vf)]}
 
         # Define net_arch options
         net_arch_options = [[64, 64], [128, 128], [256, 128]]

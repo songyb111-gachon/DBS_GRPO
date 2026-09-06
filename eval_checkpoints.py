@@ -206,6 +206,14 @@ def make_grpo_action_fn(policy, device='cuda'):
     return select
 
 
+def make_random_action_fn():
+    """랜덤 DBS: 무작위 픽셀 선택"""
+    num_pixels = CH * IPS * IPS
+    def select(obs):
+        return np.random.randint(num_pixels)
+    return select
+
+
 def run_dbs(state, pre_model, target_image, target_image_np,
             max_steps, select_action_fn):
     state = state.copy()
@@ -281,6 +289,7 @@ if __name__ == '__main__':
     MAX_STEPS       = 500                               # 이미지당 DBS 스텝 수 (작을수록 빠름)
     NUM_EVAL_IMAGES = 10                                # 평가에 사용할 이미지 수 (0 = 전체)
     EVAL_DIR        = '/nfs/dataset/DIV2K/DIV2K_valid_HR/DIV2K_valid_HR/'  # 평가 데이터셋 경로
+    INCLUDE_RANDOM_BASELINE = False   # True: 같은 이미지·스텝으로 Random DBS 를 1회 돌려 기준선 행을 표·CSV 에 추가 (episode=0, checkpoint=random_baseline)
     # ════════════════════════════════════════════════════════════
 
     meta = {'wl': 515e-9, 'dx': (7.56e-6, 7.56e-6)}
@@ -293,6 +302,7 @@ if __name__ == '__main__':
     print(f"  Max Steps/Image: {MAX_STEPS}")
     print(f"  Eval Images:     {'전체' if NUM_EVAL_IMAGES == 0 else NUM_EVAL_IMAGES}")
     print(f"  Eval Data Dir:   {EVAL_DIR}")
+    print(f"  Random Baseline: {INCLUDE_RANDOM_BASELINE}")
     print(f"{'=' * 60}\n")
 
     # --- 데이터 ---
@@ -353,6 +363,35 @@ if __name__ == '__main__':
           f"{'Avg Flips':>10}  {'Time':>8}")
     print(f"{'━' * 90}")
 
+    if INCLUDE_RANDOM_BASELINE:
+        # Random DBS 기준선: 같은 이미지·같은 초기 홀로그램·같은 스텝 수로 1회. 시드는 고정하지 않는다.
+        t_start = time.time()
+        base_results = []
+        for img in eval_images:
+            torch.cuda.empty_cache()
+            base_results.append(run_dbs(
+                state=img["initial_state"],
+                pre_model=img["pre_model"],
+                target_image=img["target_image"],
+                target_image_np=img["target_image_np"],
+                max_steps=MAX_STEPS,
+                select_action_fn=make_random_action_fn(),
+            ))
+        elapsed = time.time() - t_start
+        all_results.append({
+            "episode": 0,
+            "checkpoint": "random_baseline",
+            "avg_psnr_diff": np.mean([r["psnr_diff"] for r in base_results]),
+            "avg_success_ratio": np.mean([r["success_ratio"] for r in base_results]),
+            "avg_flip_count": np.mean([r["flip_count"] for r in base_results]),
+            "time": elapsed,
+            "per_image": base_results,
+        })
+        b = all_results[-1]
+        print(f"  {'random_baseline':<20} {'-':>8}  "
+              f"{b['avg_psnr_diff']:>+10.4f}  {b['avg_success_ratio']:>12.2%}  "
+              f"{b['avg_flip_count']:>10.1f}  {elapsed:>7.1f}s")
+
     for ep_num, ckpt_path in checkpoints:
         # 체크포인트 로드
         ckpt = torch.load(ckpt_path, map_location='cuda')
@@ -399,8 +438,10 @@ if __name__ == '__main__':
     # --- 최고 성능 체크포인트 ---
     print(f"\n{'━' * 90}")
 
-    best_psnr = max(all_results, key=lambda x: x["avg_psnr_diff"])
-    best_success = max(all_results, key=lambda x: x["avg_success_ratio"])
+    # '최고 체크포인트' 는 체크포인트끼리만 고른다. 기준선이 더 좋은 경우는 아래 기준선 대비 요약이 따로 말한다.
+    ckpt_rows = [r for r in all_results if r["checkpoint"] != "random_baseline"]
+    best_psnr = max(ckpt_rows, key=lambda x: x["avg_psnr_diff"])
+    best_success = max(ckpt_rows, key=lambda x: x["avg_success_ratio"])
 
     print(f"\n  🏆 PSNR 향상 최고:  ep{best_psnr['episode']}  "
           f"(+{best_psnr['avg_psnr_diff']:.4f} dB)  "
@@ -408,6 +449,24 @@ if __name__ == '__main__':
     print(f"  🏆 성공률 최고:     ep{best_success['episode']}  "
           f"({best_success['avg_success_ratio']:.2%})  "
           f"→ {best_success['checkpoint']}")
+
+    if INCLUDE_RANDOM_BASELINE:
+        base = next(r for r in all_results if r["checkpoint"] == "random_baseline")
+        ckpts = ckpt_rows
+        n_psnr = sum(1 for r in ckpts if r["avg_psnr_diff"] > base["avg_psnr_diff"])
+        n_succ = sum(1 for r in ckpts if r["avg_success_ratio"] > base["avg_success_ratio"])
+        print(f"\n  Random 기준선 대비 (PSNR↑ {base['avg_psnr_diff']:+.4f} dB, 성공률 {base['avg_success_ratio']:.2%}):")
+        print(f"    PSNR↑ 가 기준선보다 높은 체크포인트: {n_psnr}/{len(ckpts)}")
+        print(f"    성공률이 기준선보다 높은 체크포인트: {n_succ}/{len(ckpts)}")
+        # 같은 이미지끼리 짝지어 센 값이 평균 하나의 부등호보다 안정적이다
+        n_img = len(base["per_image"])
+        print(f"    체크포인트별 '기준선을 이긴 이미지 수' (같은 이미지끼리 PSNR↑ 비교, 총 {n_img}장):")
+        for r in ckpts:
+            wins = sum(1 for a, b in zip(r["per_image"], base["per_image"]) if a["psnr_diff"] > b["psnr_diff"])
+            print(f"      ep{r['episode']:>5}: {wins}/{n_img}")
+        if n_psnr == 0:
+            print("    → 무처리(초기 홀로그램) 대비 개선이 있어도 Random DBS 대비 개선이 없으면 '학습/개선 안 됨' 으로 판정한다")
+        print("    (주의: 기준선·체크포인트 모두 시드 미고정 1회 실행 - 차이가 작으면 재실행으로 확인 필요)")
 
     # --- 결과 CSV 저장 ---
     result_dir = f"./eval_results/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}/"

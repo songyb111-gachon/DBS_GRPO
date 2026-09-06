@@ -28,6 +28,11 @@ IPS = 256  #이미지 픽셀 사이즈
 CH = 8  #채널
 RW = 800  #보상
 
+# 광학 도메인 상수 — 물리 장치가 정하는 값이라 튜닝 대상이 아니다. 이 저장소의 모든 시뮬레이션 지점이 이 값을 쓴다
+# (train_grpo.py 는 여기서 import; test_grpo.py/eval_checkpoints.py/DBS.py 의 리터럴은 check_conventions.py 가 같은 값인지 대조한다).
+OPTICS_META = {'dx': (7.56e-6, 7.56e-6), 'wl': 515e-9}   # 픽셀 피치 7.56 um, 파장 515 nm
+PROP_Z = 2e-3                                            # 전파 거리 2 mm
+
 warnings.filterwarnings('ignore')
 
 # 현재 날짜와 시간을 가져와 포맷 지정
@@ -105,7 +110,7 @@ class BinaryHologramEnv(gym.Env):
             self.state[0, channel, row, col] = 1 - self.state[0, channel, row, col]
 
             binary_temp = torch.tensor(self.state, dtype=torch.float32).cuda()
-            binary_temp = tt.Tensor(binary_temp, meta={'dx': (7.56e-6, 7.56e-6), 'wl': 515e-9})
+            binary_temp = tt.Tensor(binary_temp, meta=OPTICS_META)
 
             sim_temp = tt.simulate(binary_temp, z).abs() ** 2
             result_temp = torch.mean(sim_temp, dim=1, keepdim=True)
@@ -145,7 +150,7 @@ class BinaryHologramEnv(gym.Env):
 
         return psnr_changes, importance_ranks, positive_psnr_sum
 
-    def reset(self, seed=None, options=None, z=2e-3):
+    def reset(self, seed=None, options=None, z=PROP_Z):
         torch.cuda.empty_cache()
 
         self.episode_num_count += 1  # Increment episode count at the start of each reset
@@ -179,7 +184,7 @@ class BinaryHologramEnv(gym.Env):
         self.state_record = np.zeros_like(self.state)  # 플립 횟수를 저장하기 위한 배열 초기화
 
         binary = torch.tensor(self.state, dtype=torch.float32).cuda()  # (1, CH, IPS, IPS)
-        binary = tt.Tensor(binary, meta={'dx': (7.56e-6, 7.56e-6), 'wl': 515e-9})  # meta 정보 포함
+        binary = tt.Tensor(binary, meta=OPTICS_META)  # meta 정보 포함
 
         # 시뮬레이션
         sim = tt.simulate(binary, z).abs()**2
@@ -220,7 +225,7 @@ class BinaryHologramEnv(gym.Env):
 
         return obs, {"state": self.state}
 
-    def step(self, action, z=2e-3):
+    def step(self, action, z=PROP_Z):
         self.steps += 1
 
         # 행동을 기반으로 픽셀 좌표 계산
@@ -237,7 +242,7 @@ class BinaryHologramEnv(gym.Env):
 
         # 시뮬레이션 수행
         binary_after = torch.tensor(self.state, dtype=torch.float32).cuda()
-        binary_after = tt.Tensor(binary_after, meta={'dx': (7.56e-6, 7.56e-6), 'wl': 515e-9})
+        binary_after = tt.Tensor(binary_after, meta=OPTICS_META)
         sim_after = tt.simulate(binary_after, z).abs()**2
         result_after = torch.mean(sim_after, dim=1, keepdim=True)
         psnr_after = tt.relativeLoss(result_after, self.target_image, tm.get_PSNR)

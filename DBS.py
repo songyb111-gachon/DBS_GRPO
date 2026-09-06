@@ -224,11 +224,14 @@ def optimize_with_random_pixel_flips(env, z=2e-3):
         steps = 0
         flip_count = 0
         psnr_after = 0
+        psnr_change = 0.0    # 마지막 0.5 dB 임계 통과 시점의 단일 플립 변화량 (한 번도 못 넘으면 0). 총 개선량은 Diff 필드
+        success_ratio = 0.0
 
         # 다음 출력 기준 PSNR 값 리스트 설정 (0.5 단위로 증가)
         next_print_thresholds = [initial_psnr + i * 0.5 for i in range(1, 21)]  # 최대 10.0 상승까지 출력
 
-        a, imgname = next(iter(env.trainloader))
+        # env.reset() 이 방금 꺼낸 파일 경로. (예전의 next(iter(env.trainloader)) 는 항상 첫 파일을 돌려줘 로그 파일명이 어긋났다)
+        imgname = env.current_file
 
         # imgname에서 파일 이름 추출
         if isinstance(imgname, list) or isinstance(imgname, tuple):
@@ -295,12 +298,13 @@ def optimize_with_random_pixel_flips(env, z=2e-3):
                 # PSNR이 개선되지 않았으면 플립 롤백
                 current_state[0, channel, row, col] = 1 - current_state[0, channel, row, col]
 
-        # 최종 결과 출력
-        psnr_diff = psnr_after - initial_psnr
+        # 최종 결과 출력. 최종 PSNR 은 마지막 시도(psnr_after, 거절됐을 수 있음)가 아니라 현재 채택 상태의 PSNR(previous_psnr)이다.
+        psnr_diff = previous_psnr - initial_psnr
+        success_ratio = flip_count / steps if steps > 0 else 0.0
         data_processing_time = time.time() - total_start_time
         print(
             f"Step: {steps}"
-            f"\nPSNR Before: {previous_psnr:.6f} | PSNR After: {psnr_after:.6f} | Change: {psnr_change:.6f} | Diff: {psnr_diff:.6f}"
+            f"\nPSNR Before: {previous_psnr:.6f} | PSNR After: {previous_psnr:.6f} | Change: {psnr_change:.6f} | Diff: {psnr_diff:.6f}"
             f"\nSuccess Ratio: {success_ratio:.6f} | Flip Count: {flip_count}"
             f"\nFlip Pixel: Channel={channel}, Row={row}, Col={col}"
             f"\nTime taken for this data: {data_processing_time:.2f} seconds"

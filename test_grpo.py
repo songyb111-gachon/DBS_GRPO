@@ -442,6 +442,8 @@ def run_test_on_dataset(dataset_name, data_loader, hologram_model,
         )
         print_result(r_random)
 
+        r_grpo["image"] = file_name
+        r_random["image"] = file_name
         results_grpo.append(r_grpo)
         results_random.append(r_random)
 
@@ -464,7 +466,7 @@ def run_test_on_dataset(dataset_name, data_loader, hologram_model,
             f.write("dataset,image,method,initial_psnr,final_psnr,psnr_diff,flip_count,success_ratio,time\n")
             for rg, rr in zip(results_grpo, results_random):
                 for r in [rg, rr]:
-                    f.write(f"{dataset_name},{r['label']},{r['label']},"
+                    f.write(f"{dataset_name},{r['image']},{r['label']},"
                             f"{r['initial_psnr']:.6f},{r['final_psnr']:.6f},"
                             f"{r['psnr_diff']:.6f},{r['flip_count']},"
                             f"{r['success_ratio']:.6f},{r['time']:.2f}\n")
