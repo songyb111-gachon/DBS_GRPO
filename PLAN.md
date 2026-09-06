@@ -106,7 +106,30 @@ env.py 의 정의(max_steps, T_PSNR, T_PSNR_DIFF, num_samples), 광학 상수(`o
 
 - **2026-09-07 검증 궤적** (`grpo/val_summary.py`, 98줄): 50→150 반복에서 정책이 균등(eff 3.5만)에서 약 10개 액션으로 붕괴하며 recovery 0.07→0.21; 150~1000 은 0.25 근처 정체; 1000→4900 은 완만히 상승해 0.33~0.37, 최고 0.399(it 4850). 아직 포화 아님. E_π[R] ≈ E_π[R⁺] 라 손해 보는 플립을 거의 고르지 않는다(P_π 95~99%). it 2850·3650 에 P_π 가 55%·70% 로 떨어졌다 50 반복 안에 회복 — 참조 대비 KL 2~5 nat 의 빠른 이동과 같은 현상. 다음: `eval_checkpoints.py`(Random·오라클 탐욕 포함) 로 DBS 루프 수준의 '이김' 판정.
 
-## 6. 결정 (소유자 확인)
+## 6. 하이퍼파라미터 감사 (2026-09-07)
+
+네 관점(GRPO 원 논문 대조 / 문제 스케일 / 런 진단 / 코드 의미) 감사 + 반박 검증, 그리고 LLM 밖 GRPO 문헌 조사(DanceGRPO, Flow-GRPO, Mask-GRPO, STAGE, DiffusionNFT, Pref-GRPO, TempFlow-GRPO, DiverseGRPO, Discrete-Action-Space, Learning Without Critics(2511.03527), U-statistic(2603.01162), Dr.GRPO, DAPO, Entropy Mechanism)의 결론.
+
+| 손잡이 | 현재 | 판정 | 근거 요약 |
+|---|---|---|---|
+| adv_baseline=sample, reward_transform=relu | — | 유지 (방법 정의) | DeepSeek 식 그대로. \|A\| ≤ √(G−1)=7.9 로 유계, 전부 같으면 A=0 (자기제한). relu 는 평가 지표와 같은 함수 |
+| group_size | 64 | **512 로 (공짜)** | 비용은 gather 뿐이라 반복 시간 불변. 상태 내 분산 1/8, π=1e-3 액션 발견 6%→40%. 정체 해소 여부는 확인 필요 |
+| update_epochs / minibatch_states | 2 / 4 | **1 / (4 유지 또는 8)** | DeepSeekMath 실험은 μ=1. 표본이 공짜라 재사용 이유 없음. 관측 clipfrac 0.2~0.55 는 off-policy 스텝 3개의 낭비(그 스텝은 KL 되돌림만) |
+| lr | 3e-4 | **1e-4 (조건부)** | Adam 이동량 ∝ lr 이 유일한 신뢰영역. 두 번째 미니배치도 잘리는 것은 한 스텝 이동 자체가 큼. 판정: 스텝2 clipfrac ≤0.1~0.2, 참조 갱신 직전 KL <1 nat, P_π dip 소멸 |
+| clip_range, kl_coef, max_grad_norm, entropy_coef | 0.2, 0.04, 0.5, 0 | 유지 | 논문값. KL 항은 현재 앵커가 아니라 속도 저항. 엔트로피 항은 논문에 없음(비교 arm 만) |
+| ref_update_iters | 50 | 유지 (0 은 기각) | 이동 참조는 DeepSeek 의 iterative GRPO. 0(초기 균등 참조)은 k3 기울기 포화로 앵커·엔트로피 효과 없음 |
+| adv_std_floor_rel | 0 | 유지 (1e-3 기각) | 발동 조건이 사실상 없고, 걸려도 GRPO 정의를 그 영역에서만 바꿈 |
+| KL log-ratio clamp ±10 | 코드 | **하한 제거 (버그 급)** | 하한은 수치 보호 기능이 없고, 가장 멀리 간 표본의 KL 기울기를 0 으로 만드는 조용한 폴백 (v1 사본) |
+| ratio clamp [0,10] | 코드 | **제거 (정의 편차)** | 문서화되지 않은 dual-clip(c=10). NaN 은 이 클램프가 있어도 났음 |
+| steps_per_image | 200 | **600 이상 + 교체 엇갈림** | 학습은 평가 궤적의 앞 1/3 만 봄. 값은 random_dbs_curve 결과·평가 지평 통일 뒤 확정 |
+| val_advance_steps | 100 (≈21 플립) | **≈2500 + 초기/진행 분리 보고** | 지금 '진행 상태'는 초기와 같은 분포. 분리 키(_init/_adv) 는 이번에 추가 |
+| images_per_batch, logit clamp ±20, nonfinite_limit | 8, 20, 20 | 유지 | K 는 원인 귀속 뒤 스윕; 클램프는 sat 로 감시 |
+
+문헌과의 대조: 문헌은 (a) 고정 참조 + 작고 일정한 KL, (b) 그룹 std 대신 배치 std + ±5 클램프, (c) epoch 1·작은 lr 을 권하나, (a) 는 모두 사전학습 prior 가 있는 설정이고 우리 코드에서는 고정 참조가 앵커가 되지 못한다(감사). (b) 는 GRPO 정의를 바꾸는 것이라 비교 arm. (c) 는 감사와 일치. 붕괴 고리(미샘플 액션 하향 → support 축소 → 그룹 중복 → 참조 소실)의 실측을 위해 distinct/std_min/klclamp/r10neg/clip_first·rest 를 로그에 추가했다.
+
+적용 원칙: 진단 로깅·주석·검증 분리는 즉시(의미 불변). 클램프 제거·E=1·lr·G·steps_per_image·val_advance_steps 는 **새 런 경계**에서 소유자 결정 후 한 묶음("DeepSeek 체제 정합" 런)으로. 평가 지평 600(PLAN)/500(eval_checkpoints)/1000(test_grpo) 은 손복사본 불일치 — 소유자가 하나로 정한다.
+
+## 7. 결정 (소유자 확인)
 
 오라클·스모크 게이트 통과(2026-09-06) 후 기본 트레이너를 v2 로 바꿨다(v1 은 CONFIG 한 줄로 복귀, 산출물 폴더 분리). 막히는 결정은 없으나 아래는 소유자의 판단이 필요하다.
 

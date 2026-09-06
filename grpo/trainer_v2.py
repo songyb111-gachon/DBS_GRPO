@@ -124,12 +124,13 @@ class GRPOTrainerV2:
                 R = R_all[actions]
                 Rp = Rp_all[actions]
                 m, s = self._baseline(Rp_all, Rp, dist.probs)
-                if self.cfg["adv_std_floor_rel"] > 0:                # 정책이 뾰족해져 표본이 겹치면 std 가 붕괴해 A 가 폭주한다
+                if self.cfg["adv_std_floor_rel"] > 0:                # 비교 arm. 표본 z-score 는 |A| ≤ √(G−1) 로 유계라 NaN 대책이 아니다 (감사 2026-09-07)
                     s = torch.maximum(s, self.cfg["adv_std_floor_rel"] * Rp_all.max())
                 adv = (Rp - m) / (s + 1e-12)
                 adv_map = (Rp_all - m) / (s + 1e-12) if self.cfg["objective"] == "exact" else None
             batch.append({"feats": feats, "actions": actions, "old_logp": old_logp, "adv": adv,
-                          "R": R, "adv_map": adv_map, "img": img})
+                          "R": R, "adv_map": adv_map, "img": img,
+                          "n_distinct": int(actions.unique().numel()), "std": float(s)})   # 그룹 진단 (중복·std 붕괴 감시)
         self.policy.train()
         return batch
 
@@ -149,8 +150,10 @@ class GRPOTrainerV2:
     def update(self, batch):
         cfg = self.cfg
         E, M = cfg["update_epochs"], cfg["minibatch_states"]
-        stats = {"loss": [], "pg": [], "kl": [], "clipfrac": [], "entropy": [], "gnorm": []}
+        stats = {"loss": [], "pg": [], "kl": [], "clipfrac": [], "entropy": [], "gnorm": [],
+                 "clip_first": [], "clip_rest": [], "klclamp": [], "r10neg": [], "maxlr": []}
         idx = list(range(len(batch)))
+        step_idx = 0                       # 반복 안의 옵티마이저 스텝 번호 (0 = ratio≡1 인 on-policy 스텝)
         for _ in range(E):
             np.random.shuffle(idx)
             for s in range(0, len(idx), M):
@@ -161,6 +164,7 @@ class GRPOTrainerV2:
                 with torch.no_grad():
                     ref_logp_all = F.log_softmax(self.ref_policy(feats), dim=1)
                 pg_terms, kl_terms, clip_terms, ent_terms = [], [], [], []
+                diag_klclamp, diag_r10neg, diag_maxlr = [], [], []
                 for j, it in enumerate(items):
                     a = it["actions"]
                     new_lp, ref_lp = logp_all[j][a], ref_logp_all[j][a]
@@ -169,13 +173,18 @@ class GRPOTrainerV2:
                         pg = -(probs * it["adv_map"]).sum()
                         clipfrac = torch.zeros((), device=self.device)
                     else:
-                        ratio = torch.exp(new_lp - it["old_logp"])
+                        logratio = new_lp - it["old_logp"]
+                        ratio = torch.exp(logratio)
+                        diag_r10neg.append(((ratio > 10.0) & (it["adv"] < 0)).float().mean())   # 아래 clamp 가 GRPO 정의와 다르게 기울기를 0 으로 만드는 표본
+                        diag_maxlr.append(logratio.abs().max())
                         ratio = torch.clamp(ratio, 0.0, 10.0)
                         surr1 = ratio * it["adv"]
                         surr2 = torch.clamp(ratio, 1 - cfg["clip_range"], 1 + cfg["clip_range"]) * it["adv"]
                         pg = -torch.min(surr1, surr2).mean()
                         clipfrac = ((ratio - 1).abs() > cfg["clip_range"]).float().mean()
-                    lr_ref = torch.clamp(ref_lp - new_lp, -10.0, 10.0)
+                    raw_lr = ref_lp - new_lp
+                    diag_klclamp.append((raw_lr.abs() > 10.0).float().mean())   # 클램프에 걸려 KL 기울기가 0 이 되는 표본 비율
+                    lr_ref = torch.clamp(raw_lr, -10.0, 10.0)
                     kl = (torch.exp(lr_ref) - lr_ref - 1.0).mean()               # k3 추정 (샘플 액션에서)
                     ent = -(logp_all[j].exp() * logp_all[j]).sum()
                     pg_terms.append(pg); kl_terms.append(kl); clip_terms.append(clipfrac); ent_terms.append(ent)
@@ -200,6 +209,12 @@ class GRPOTrainerV2:
                 stats["gnorm"].append(float(gnorm))
                 stats["loss"].append(loss.item()); stats["pg"].append(pg.item()); stats["kl"].append(kl.item())
                 stats["clipfrac"].append(torch.stack(clip_terms).mean().item()); stats["entropy"].append(ent.item())
+                (stats["clip_first"] if step_idx == 0 else stats["clip_rest"]).append(torch.stack(clip_terms).mean().item())
+                stats["klclamp"].append(torch.stack(diag_klclamp).mean().item())
+                if diag_r10neg:
+                    stats["r10neg"].append(torch.stack(diag_r10neg).mean().item())
+                    stats["maxlr"].append(torch.stack(diag_maxlr).max().item())
+                step_idx += 1
         return {k: (float(np.mean(v)) if v else float("nan")) for k, v in stats.items()}
 
     def advance(self, batch):
@@ -241,7 +256,14 @@ class GRPOTrainerV2:
                 "saturation": self.policy.saturation(feats),
             })
         self.policy.train()
-        return {k: float(np.nanmean([r[k] for r in rows])) for k in rows[0]}
+        out = {k: float(np.nanmean([r[k] for r in rows])) for k in rows[0]}
+        # 앞 절반 = 초기 상태, 뒤 절반 = val_advance_steps 진행 상태. 기존 키(전체 평균)는 그대로 두고 분리 키를 덧붙인다.
+        half = len(rows) // 2
+        if half >= 1:
+            for k in ("E_pi_relu", "recovery", "P_pi", "top1", "E_unif_relu"):
+                out[k + "_init"] = float(np.nanmean([r[k] for r in rows[:half]]))
+                out[k + "_adv"] = float(np.nanmean([r[k] for r in rows[half:]]))
+        return out
 
     # ---------------------------------------------------------------- 루프
     def train(self, num_iters, save_dir, save_every, val_every):
@@ -258,7 +280,10 @@ class GRPOTrainerV2:
             self.iteration += 1
             R_cat = torch.cat([it["R"] for it in batch])
             print(f"[v2 it {self.iteration}] loss={st['loss']:+.4f} pg={st['pg']:+.4f} kl={st['kl']:.4f} "
-                  f"clip={st['clipfrac']:.2f} gn={st['gnorm']:.2f} H={st['entropy']:.2f} | sampled R: mean={float(R_cat.mean()):+.2e} "
+                  f"clip={st['clipfrac']:.2f}({st['clip_first']:.2f}/{st['clip_rest']:.2f}) gn={st['gnorm']:.2f} H={st['entropy']:.2f} "
+                  f"klclamp={st['klclamp']:.1%} r10neg={st['r10neg']:.1%} |lr|max={st['maxlr']:.1f} "
+                  f"distinct={np.mean([it['n_distinct'] for it in batch]):.0f}/{self.cfg['group_size']} std_min={min(it['std'] for it in batch):.1e} "
+                  f"| sampled R: mean={float(R_cat.mean()):+.2e} "
                   f"P>0={float((R_cat > 0).float().mean()):.2%} | advance acc={acc}/{len(batch)} new_img={rep} "
                   f"| psnr_gain(avg)={np.mean([it['img'].gain for it in batch]):+.4f} | {time.time() - t0:.1f}s")
             if self.cfg["ref_update_iters"] > 0 and self.iteration % self.cfg["ref_update_iters"] == 0:
@@ -269,7 +294,9 @@ class GRPOTrainerV2:
                 print(f"  [v2 val {self.iteration}] E_pi_relu={v['E_pi_relu']:+.3e} E_unif_relu={v['E_unif_relu']:+.3e} "
                       f"top1={v['top1']:+.3e} recovery={v['recovery']:.3f} | P_pi={v['P_pi']:.2%} P_unif={v['P_unif']:.2%} "
                       f"| E_pi_raw={v['E_pi_raw']:+.3e} E_unif_raw={v['E_unif_raw']:+.3e} argmax_R={v['R_argmax']:+.3e} "
-                      f"| H={v['entropy']:.2f} eff={v['eff_support']:.0f} sat={v['saturation']:.3f}")
+                      f"| H={v['entropy']:.2f} eff={v['eff_support']:.0f} sat={v['saturation']:.3f}"
+                      + (f" | init/adv: recovery={v['recovery_init']:.3f}/{v['recovery_adv']:.3f} "
+                         f"P_pi={v['P_pi_init']:.1%}/{v['P_pi_adv']:.1%}" if 'recovery_init' in v else ""))
                 with open(val_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps({"iter": self.iteration, **v}) + "\n")
             if self.iteration % save_every == 0:
