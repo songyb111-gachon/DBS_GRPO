@@ -2,13 +2,13 @@
 
 연구 질문은 그대로다: **GRPO 로 학습한 정책이 DBS 의 "다음에 뒤집을 픽셀" 을 Random DBS 보다 잘 고르는가.**
 이 문서는 그 정책이 실제로 배우게 만드는 *학습 구조*의 설계이고, 평가 프로토콜(고정 스텝 DBS 에서 PSNR 향상, Random 대비)은 바꾸지 않는다.
-v2 는 `train_grpo.py` 의 `CONFIG["trainer"] = "v2"` 로 켠다. 기본값은 `"v1"`(기존 동작 그대로).
+v2 는 `train_grpo.py` 의 `CONFIG["trainer"]` 로 고른다. 오라클·스모크 게이트를 통과한 2026-09-06 부터 기본값이 `"v2"` 다(`"v1"` 은 예전 경로, gymnasium 필요).
 
 ## 0. 성공 판정
 
 | 판정 | 기준 | 어디서 |
 |---|---|---|
-| 학습됨 | 고정 검증 상태에서 정책이 고른 플립의 **실현 이득** E_π[R⁺] (R⁺ = max(ΔPSNR, 0)) 가 균등 무작위 E_unif[R⁺] 를 명확히 넘어 오르고, 개선 확률 P_π(R>0) > P_unif, **회수율** E_π[R⁺]/top-1 ≥ 0.1 | 학습 로그 `[v2 val]` 줄 (오라클로 정확히 계산, 시뮬레이션 불필요), `val.jsonl` |
+| 학습됨 | 고정 검증 상태에서 정책이 고른 플립의 **실현 이득** E_π[R⁺] (R⁺ = max(ΔPSNR, 0)) 가 균등 무작위 E_unif[R⁺] 를 명확히 넘어 오르고, 개선 확률 P_π(R>0) > P_unif, **회수율** (E_π[R⁺] − E_unif[R⁺])/(top-1 − E_unif[R⁺]) ≥ 0.1 (0 = 균등, 1 = 오라클) | 학습 로그 `[v2 val]` 줄 (오라클로 정확히 계산, 시뮬레이션 불필요), `val.jsonl` |
 | 이김 | 검증 이미지, 이미지당 고정 스텝(600) DBS 에서 GRPO 정책의 평균 PSNR 향상 > Random DBS, 이미지별 승수 과반 | `eval_checkpoints.py` (INCLUDE_RANDOM_BASELINE) — 프로토콜은 §2.5 |
 | 천장 | 같은 조건의 **오라클 탐욕 DBS**(매 스텝 실제 최선 픽셀) 대비 회수율 | `eval_checkpoints.py` (INCLUDE_ORACLE_GREEDY) — 본 실험 표에 필수 |
 
@@ -65,7 +65,7 @@ v2 는 `train_grpo.py` 의 `CONFIG["trainer"] = "v2"` 로 켠다. 기본값은 `
 ### 2.4 학습 중 검증 지표 (시뮬레이션 없이 정확)
 
 고정 검증 상태 V 개(검증 이미지 앞 V 장의 초기 홀로그램; 뒤 절반은 무작위-채택 DBS 로 `val_advance_steps` 진행한 중반 상태)에서 `val_every` 마다 한 줄:
-E_π[R⁺], E_unif[R⁺], top-1 R, **회수율** E_π[R⁺]/top-1, P_π(R>0), P_unif, E_π[R], E_unif[R], R(argmax π), 엔트로피, 유효 지지 크기 exp(H), 게이트 포화도. **학습됨 판정은 이 줄로 한다(§0).** `val.jsonl` 에 누적된다.
+E_π[R⁺], E_unif[R⁺], top-1 R, **회수율** (E_π[R⁺] − E_unif[R⁺])/(top-1 − E_unif[R⁺]), P_π(R>0), P_unif, E_π[R], E_unif[R], R(argmax π), 엔트로피, 유효 지지 크기 exp(H), 게이트 포화도. **학습됨 판정은 이 줄로 한다(§0).** `val.jsonl` 에 누적된다.
 
 ### 2.5 평가
 
@@ -74,15 +74,15 @@ E_π[R⁺], E_unif[R⁺], top-1 R, **회수율** E_π[R⁺]/top-1, P_π(R>0), P_
 
 ### 2.6 바꾸지 않는 것
 
-env.py 의 정의(max_steps, T_PSNR, T_PSNR_DIFF, num_samples), 광학 상수(`optics_constants.py`), 평가 지표와 프로토콜, 기존 v1 학습 경로(`trainer: "v1"` 기본값 — v2 는 켰을 때만 `grpo_models_v2_<policy_kind>/` 로 감), v1 체크포인트의 평가 결과(v1 은 레거시 GRPOPolicy 로 예전과 똑같이 읽는다).
+env.py 의 정의(max_steps, T_PSNR, T_PSNR_DIFF, num_samples), 광학 상수(`optics_constants.py`), 평가 지표와 프로토콜, 기존 v1 학습 경로(`trainer: "v1"` 로 선택 가능; v2 산출물은 별도 폴더 `grpo_models_v2_<policy_kind>/` 라 v1 산출물과 섞이지 않음), v1 체크포인트의 평가 결과(v1 은 레거시 GRPOPolicy 로 예전과 똑같이 읽는다).
 
 ## 3. 단계와 게이트
 
 | 단계 | 파일 | 게이트 | 상태 |
 |---|---|---|---|
 | 1. 오라클 | `grpo/oracle.py`, `grpo/oracle_selftest.py`, `grpo/oracle_algebra_check_np.py` | 로컬 numpy 대수 검증 / 서버 selftest ALL PASS | 로컬 PASS / 서버 **PASS** (2026-09-06, §2.1 서버 결과) |
-| 2. 특징·정책 | `grpo/features.py`, `grpo/policies.py` | `grpo/smoke_v2.py` 형상·유한성 | 구현, 서버 **확인 필요** |
-| 3. 트레이너 v2 | `grpo/trainer_v2.py`, `grpo/dbs_state.py`, `train_grpo.py` CONFIG["v2"] | smoke 3조합(grpo/sample, grpo/policy, exact/uniform) + 체크포인트 저장·로드 | 구현, 서버 **확인 필요** |
+| 2. 특징·정책 | `grpo/features.py`, `grpo/policies.py` | `grpo/smoke_v2.py` 형상·유한성 | 서버 smoke PASS (2026-09-06, CUDA) |
+| 3. 트레이너 v2 | `grpo/trainer_v2.py`, `grpo/dbs_state.py`, `train_grpo.py` CONFIG["v2"] | smoke 3조합(grpo/sample, grpo/policy, exact/uniform) + 체크포인트 저장·로드 | 서버 smoke PASS (2026-09-06, CUDA) |
 | 4. 평가 지원 | `grpo/eval_utils.py`, `eval_checkpoints.py`, `test_grpo.py` | v1 체크포인트 결과 불변, v2 로드, 오라클 탐욕 행 | 구현, `check_conventions.py` 66/66 |
 | 5. 서버 프로토콜 | — | (a) selftest → (b) smoke → (c) 짧은 런(수백 반복, K=4)에서 `[v2 val]` 의 E_π[R⁺] 가 E_unif[R⁺] 를 넘어 오르는지 → (d) 본 런 + `eval_checkpoints`(Random·오라클·split/seed) → (e) unet vs fno(학습 속도 비교) | 사용자가 서버에서 실행 |
 | 6. 후속 | — | 학습되면 steps_per_image·G·K 스윕; 학습되는데 평가에서 Random 을 못 넘으면 advance="sample"·reward_transform 비교 | — |
@@ -102,7 +102,7 @@ env.py 의 정의(max_steps, T_PSNR, T_PSNR_DIFF, num_samples), 광학 상수(`o
 
 ## 5. 결정 (소유자 확인)
 
-기본값은 전부 기존 동작(v1)이고 v2 는 `trainer="v2"` 로 켠다. 막히는 결정은 없으나 아래는 소유자의 판단이 필요하다.
+오라클·스모크 게이트 통과(2026-09-06) 후 기본 트레이너를 v2 로 바꿨다(v1 은 CONFIG 한 줄로 복귀, 산출물 폴더 분리). 막히는 결정은 없으나 아래는 소유자의 판단이 필요하다.
 
 1. **어드밴티지 기본값** `adv_baseline="sample"`(GRPO 정의 그대로). `"policy"`/`"uniform"` 은 비교 arm 으로만 둔다 — 동의하는지.
 2. **보상 변환 기본값** `reward_transform="relu"`. 평가 지표와 같은 함수라는 이유이고, `"raw"` 는 비교 arm — 동의하는지.

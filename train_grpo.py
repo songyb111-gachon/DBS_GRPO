@@ -79,7 +79,7 @@ CONFIG = {
     "seed": None,               # None: 비고정 (기존 동작). 정수(예: 0)면 random/numpy/torch 시드 고정.
                                 # 재개(resume) 시에는 시드가 다시 처음부터 적용돼 데이터 순서가 첫 런과 같아진다 — 재현용이지 이어달리기용이 아님
     # --- 학습 구조 (PLAN.md). "v1" = 기존 GRPO(상태당 16샘플을 각각 시뮬레이션). "v2" = 오라클 보상 + 배치 GRPO ---
-    "trainer": "v1",            # "v1" | "v2".  v2 로 켜면 save_dir 이 grpo_models_v2_<policy_kind>/ 로 바뀐다
+    "trainer": "v2",            # "v2"(오라클 보상 + 배치 GRPO, PLAN.md; 게이트 통과 2026-09-06 부터 기본. save_dir = grpo_models_v2_<policy_kind>/) | "v1"(예전 경로, gymnasium 필요)
     "v2": dict(
         policy_kind="unet",         # "fcn"(v1 과 같은 5층 3x3, 수용 영역 9px) | "unet"(4단, 기본 후보) | "fno"(공유 스펙트럼 필터: PSF 회귀에 가까움, 학습 속도 비교 arm)
         feature_spec="field",       # "legacy"(26ch, v1 관측; v2 에서는 state_record 채널이 항상 0) | "field"(51ch: 복소 필드·오차·곱 특징)
