@@ -77,7 +77,32 @@ class GRPOTrainerV2:
         T, h0, pre, name = self.new_image_fn()
         img = DBSImage(self.oracle, T, h0, name=name)
         img.pre_model = pre.to(self.device).float()
+        dmax = int(self.cfg["spawn_depth_max"])
+        if dmax > 0:
+            # 평가와 같은 분포의 '깊은' 상태: 현재 정책으로 무작위 깊이까지 먼저 진행 (오라클 채택 판정). 배치가 늘 여러 깊이를 섞어 본다.
+            depth = int(np.random.randint(0, dmax + 1))
+            t0 = time.time()
+            acc = self._policy_rollout(img, depth)
+            print(f"  [v2] spawn {name}: 정책 {depth} 스텝 진행 (채택 {acc}, {time.time() - t0:.0f}s) psnr {img.initial_psnr:.3f}->{img.psnr:.3f}")
+        img.spawn_steps = img.steps
         return img
+
+    @torch.no_grad()
+    def _policy_rollout(self, img, steps):
+        """현재 정책으로 DBS 를 steps 회 진행 (채택 판정은 오라클 지도, 실패 마스크 없음). 반환 채택 수."""
+        self.policy.eval()
+        acc = 0
+        for _ in range(int(steps)):
+            logits = self.policy(self._features(img)).squeeze(0)
+            a = int(torch.distributions.Categorical(logits=logits).sample())
+            if float(img.reward_map().reshape(-1)[a]) > 0:
+                ok, _ = img.apply(a)
+                acc += int(ok)
+            else:
+                img.steps += 1
+        self.policy.train()
+        return acc
+
 
     def _features(self, img):
         return build_features(self.spec, state=img.h, pre_model=img.pre_model, target=img.T,
@@ -148,23 +173,26 @@ class GRPOTrainerV2:
                                "lr / kl_coef / ref_update_iters / adv_std_floor_rel 을 볼 것")
 
     def update(self, batch):
+        """반복당 update_epochs 번의 옵티마이저 스텝. 각 스텝의 기울기는 K 상태 전체(미니배치로 나눠 누적, 상태 평균)로 만든다.
+        update_epochs=1 이면 DeepSeekMath 의 μ=1: ratio≡1 인 순수 on-policy 스텝 하나 (클립은 E>1 의 뒤 epoch 에서만 작동).
+        ratio·KL 에 클램프를 두지 않는다 (감사 2026-09-07: 예전 [0,10] ratio 클램프는 문서화 안 된 dual-clip, KL 하한 클램프는 기울기 소실)."""
         cfg = self.cfg
-        E, M = cfg["update_epochs"], cfg["minibatch_states"]
+        E, M, K = cfg["update_epochs"], cfg["minibatch_states"], len(batch)
         stats = {"loss": [], "pg": [], "kl": [], "clipfrac": [], "entropy": [], "gnorm": [],
                  "clip_first": [], "clip_rest": [], "klclamp": [], "r10neg": [], "maxlr": []}
-        idx = list(range(len(batch)))
-        step_idx = 0                       # 반복 안의 옵티마이저 스텝 번호 (0 = ratio≡1 인 on-policy 스텝)
-        for _ in range(E):
-            np.random.shuffle(idx)
-            for s in range(0, len(idx), M):
-                items = [batch[i] for i in idx[s:s + M]]
+        for ep in range(E):
+            self.optimizer.zero_grad(set_to_none=True)
+            acc = {"loss": 0.0, "pg": 0.0, "kl": 0.0, "entropy": 0.0, "clipfrac": 0.0}
+            diag = {"klclamp": [], "r10neg": [], "maxlr": []}
+            bad = False
+            for s in range(0, K, M):
+                items = batch[s:s + M]
                 feats = torch.cat([it["feats"] for it in items], dim=0)          # (M, ch, n, n)
                 logits = self.policy(feats)                                      # (M, N)
                 logp_all = F.log_softmax(logits, dim=1)
                 with torch.no_grad():
                     ref_logp_all = F.log_softmax(self.ref_policy(feats), dim=1)
                 pg_terms, kl_terms, clip_terms, ent_terms = [], [], [], []
-                diag_klclamp, diag_r10neg, diag_maxlr = [], [], []
                 for j, it in enumerate(items):
                     a = it["actions"]
                     new_lp, ref_lp = logp_all[j][a], ref_logp_all[j][a]
@@ -174,17 +202,16 @@ class GRPOTrainerV2:
                         clipfrac = torch.zeros((), device=self.device)
                     else:
                         logratio = new_lp - it["old_logp"]
-                        ratio = torch.exp(logratio)
-                        diag_r10neg.append(((ratio > 10.0) & (it["adv"] < 0)).float().mean())   # 아래 clamp 가 GRPO 정의와 다르게 기울기를 0 으로 만드는 표본
-                        diag_maxlr.append(logratio.abs().max())
-                        ratio = torch.clamp(ratio, 0.0, 10.0)
+                        ratio = torch.exp(logratio)                              # DeepSeekMath 식 (3) 그대로, 클램프 없음
+                        diag["r10neg"].append(((ratio > 10.0) & (it["adv"] < 0)).float().mean())
+                        diag["maxlr"].append(logratio.abs().max())
                         surr1 = ratio * it["adv"]
                         surr2 = torch.clamp(ratio, 1 - cfg["clip_range"], 1 + cfg["clip_range"]) * it["adv"]
                         pg = -torch.min(surr1, surr2).mean()
                         clipfrac = ((ratio - 1).abs() > cfg["clip_range"]).float().mean()
                     raw_lr = ref_lp - new_lp
-                    diag_klclamp.append((raw_lr.abs() > 10.0).float().mean())   # 클램프에 걸려 KL 기울기가 0 이 되는 표본 비율
-                    lr_ref = torch.clamp(raw_lr, -10.0, 10.0)
+                    diag["klclamp"].append((raw_lr > 10.0).float().mean())
+                    lr_ref = torch.clamp(raw_lr, max=10.0)                       # 상한만 (e^r 폭주 방지). 하한은 기울기가 유계라 두지 않는다
                     kl = (torch.exp(lr_ref) - lr_ref - 1.0).mean()               # k3 추정 (샘플 액션에서)
                     ent = -(logp_all[j].exp() * logp_all[j]).sum()
                     pg_terms.append(pg); kl_terms.append(kl); clip_terms.append(clipfrac); ent_terms.append(ent)
@@ -195,26 +222,30 @@ class GRPOTrainerV2:
                 if not torch.isfinite(loss):
                     self._skip(items, f"loss 비유한: pg={pg.item()} kl={kl.item()} ent={ent.item()} "
                                       f"logits finite={bool(torch.isfinite(logits).all())}")
-                    continue
-                self.optimizer.zero_grad()
-                loss.backward()
-                gnorm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), cfg["max_grad_norm"])
-                if not torch.isfinite(gnorm):
-                    # 기울기에 inf 가 하나라도 있으면 clip 계수가 0 이 되고 inf×0 = NaN 이 파라미터로 들어간다.
-                    # 실제 사고(iter 4927 손실 NaN 2회 → 4928 스텝 → 4929 로짓 NaN 크래시)가 이 경로였다. 스텝을 버린다.
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self._skip(items, f"grad norm={float(gnorm)} (loss={loss.item():+.4f})")
-                    continue
-                self.optimizer.step()
-                stats["gnorm"].append(float(gnorm))
-                stats["loss"].append(loss.item()); stats["pg"].append(pg.item()); stats["kl"].append(kl.item())
-                stats["clipfrac"].append(torch.stack(clip_terms).mean().item()); stats["entropy"].append(ent.item())
-                (stats["clip_first"] if step_idx == 0 else stats["clip_rest"]).append(torch.stack(clip_terms).mean().item())
-                stats["klclamp"].append(torch.stack(diag_klclamp).mean().item())
-                if diag_r10neg:
-                    stats["r10neg"].append(torch.stack(diag_r10neg).mean().item())
-                    stats["maxlr"].append(torch.stack(diag_maxlr).max().item())
-                step_idx += 1
+                    bad = True
+                    break
+                w = len(items) / K
+                (loss * w).backward()                                             # 미니배치 크기로 가중해 누적 → K 상태 평균의 기울기
+                acc["loss"] += loss.item() * w; acc["pg"] += pg.item() * w; acc["kl"] += kl.item() * w
+                acc["entropy"] += ent.item() * w; acc["clipfrac"] += torch.stack(clip_terms).mean().item() * w
+            if bad:
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
+            gnorm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), cfg["max_grad_norm"])
+            if not torch.isfinite(gnorm):
+                # 기울기에 inf 가 하나라도 있으면 clip 계수가 0 이 되고 inf×0 = NaN 이 파라미터로 들어간다 (1차 런 iter 4927~4929 사고). 스텝을 버린다.
+                self.optimizer.zero_grad(set_to_none=True)
+                self._skip(batch, f"grad norm={float(gnorm)} (loss={acc['loss']:+.4f})")
+                continue
+            self.optimizer.step()
+            for k in acc:
+                stats[k].append(acc[k])
+            stats["gnorm"].append(float(gnorm))
+            (stats["clip_first"] if ep == 0 else stats["clip_rest"]).append(acc["clipfrac"])
+            stats["klclamp"].append(torch.stack(diag["klclamp"]).mean().item())
+            if diag["r10neg"]:
+                stats["r10neg"].append(torch.stack(diag["r10neg"]).mean().item())
+                stats["maxlr"].append(torch.stack(diag["maxlr"]).max().item())
         return {k: (float(np.mean(v)) if v else float("nan")) for k, v in stats.items()}
 
     def advance(self, batch):
@@ -229,7 +260,7 @@ class GRPOTrainerV2:
                 action = int(it["actions"][np.random.randint(len(it["actions"]))])
             ok, _ = img.apply(action)
             accepted += int(ok)
-            if img.steps >= self.cfg["steps_per_image"]:
+            if img.steps - img.spawn_steps >= self.cfg["steps_per_image"]:
                 self.images[i] = self._spawn()
                 replaced += 1
         return accepted, replaced
@@ -257,12 +288,13 @@ class GRPOTrainerV2:
             })
         self.policy.train()
         out = {k: float(np.nanmean([r[k] for r in rows])) for k in rows[0]}
-        # 앞 절반 = 초기 상태, 뒤 절반 = val_advance_steps 진행 상태. 기존 키(전체 평균)는 그대로 두고 분리 키를 덧붙인다.
-        half = len(rows) // 2
-        if half >= 1:
-            for k in ("E_pi_relu", "recovery", "P_pi", "top1", "E_unif_relu"):
-                out[k + "_init"] = float(np.nanmean([r[k] for r in rows[:half]]))
-                out[k + "_adv"] = float(np.nanmean([r[k] for r in rows[half:]]))
+        # 깊이별 키 (검증 상태의 .depth). 기존 키(전체 평균)는 그대로 두고 덧붙인다.
+        depths = sorted({int(s.depth) for s in self.val_states})
+        if len(depths) > 1:
+            for d in depths:
+                sel = [r for r, s in zip(rows, self.val_states) if int(s.depth) == d]
+                for k in ("recovery", "P_pi", "E_pi_relu", "E_unif_relu", "top1", "eff_support"):
+                    out[f"{k}_d{d}"] = float(np.nanmean([r[k] for r in sel]))
         return out
 
     # ---------------------------------------------------------------- 루프
@@ -280,9 +312,10 @@ class GRPOTrainerV2:
             self.iteration += 1
             R_cat = torch.cat([it["R"] for it in batch])
             print(f"[v2 it {self.iteration}] loss={st['loss']:+.4f} pg={st['pg']:+.4f} kl={st['kl']:.4f} "
-                  f"clip={st['clipfrac']:.2f}({st['clip_first']:.2f}/{st['clip_rest']:.2f}) gn={st['gnorm']:.2f} H={st['entropy']:.2f} "
+                  f"clip={st['clipfrac']:.2f} gn={st['gnorm']:.2f} H={st['entropy']:.2f} "
                   f"klclamp={st['klclamp']:.1%} r10neg={st['r10neg']:.1%} |lr|max={st['maxlr']:.1f} "
                   f"distinct={np.mean([it['n_distinct'] for it in batch]):.0f}/{self.cfg['group_size']} std_min={min(it['std'] for it in batch):.1e} "
+                  f"depth={np.mean([it['img'].flips for it in batch]):.0f} "
                   f"| sampled R: mean={float(R_cat.mean()):+.2e} "
                   f"P>0={float((R_cat > 0).float().mean()):.2%} | advance acc={acc}/{len(batch)} new_img={rep} "
                   f"| psnr_gain(avg)={np.mean([it['img'].gain for it in batch]):+.4f} | {time.time() - t0:.1f}s")
@@ -295,8 +328,12 @@ class GRPOTrainerV2:
                       f"top1={v['top1']:+.3e} recovery={v['recovery']:.3f} | P_pi={v['P_pi']:.2%} P_unif={v['P_unif']:.2%} "
                       f"| E_pi_raw={v['E_pi_raw']:+.3e} E_unif_raw={v['E_unif_raw']:+.3e} argmax_R={v['R_argmax']:+.3e} "
                       f"| H={v['entropy']:.2f} eff={v['eff_support']:.0f} sat={v['saturation']:.3f}"
-                      + (f" | init/adv: recovery={v['recovery_init']:.3f}/{v['recovery_adv']:.3f} "
-                         f"P_pi={v['P_pi_init']:.1%}/{v['P_pi_adv']:.1%}" if 'recovery_init' in v else ""))
+                      )
+                depth_keys = sorted({int(k[len("recovery_d"):]) for k in v if k.startswith("recovery_d")})
+                if depth_keys:
+                    print("      depth: " + "  ".join(
+                        f"d{d}: rec={v[f'recovery_d{d}']:.3f} P={v[f'P_pi_d{d}']:.0%} eff={v[f'eff_support_d{d}']:.0f} top1={v[f'top1_d{d}']:.1e}"
+                        for d in depth_keys))
                 with open(val_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps({"iter": self.iteration, **v}) + "\n")
             if self.iteration % save_every == 0:

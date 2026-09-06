@@ -19,6 +19,8 @@ class DBSImage:
         self.name = name
         self.steps = 0
         self.flips = 0
+        self.depth = 0            # 검증 상태의 깊이(채택 플립 수) 라벨
+        self.spawn_steps = 0      # 학습 상태: 스폰(정책 진행) 이 끝난 시점의 steps. steps_per_image 는 그 뒤부터 센다
         self._map = None           # 마지막 오라클 결과 (dict)
         self.refresh()
         self.initial_psnr = self.psnr
@@ -63,6 +65,20 @@ class DBSImage:
                 self.apply(a)
             else:
                 self.steps += 1
+
+    def greedy_steps(self, k):
+        """오라클 최선 픽셀을 k 번 적용 (R>0 인 동안). 검증 깊이 생성용. 반환 실제 적용 수."""
+        n = 0
+        for _ in range(int(k)):
+            R = self.reward_map().reshape(-1)
+            a = int(torch.argmax(R))
+            if float(R[a]) <= 0:
+                break
+            ok, _ = self.apply(a)
+            if not ok:
+                raise RuntimeError(f"오라클 최선 픽셀 {a} (R={float(R[a]):+.2e}) 가 재계산에서 거절됨 - 오라클/상태 불일치")
+            n += 1
+        return n
 
     @property
     def gain(self):

@@ -41,7 +41,7 @@ ENTRY_SCRIPTS = [
 GRPO_FILES = ["train_grpo.py", "test_grpo.py", "eval_checkpoints.py"]
 GRPO_PKG = ["grpo/oracle.py", "grpo/features.py", "grpo/policies.py", "grpo/dbs_state.py", "grpo/trainer_v2.py",
             "grpo/eval_utils.py", "grpo/oracle_selftest.py", "grpo/smoke_v2.py", "grpo/data_prep.py", "grpo/val_summary.py",
-            "grpo/random_dbs_curve.py"]
+            "grpo/random_dbs_curve.py", "grpo/val_states.py"]
 GRPO_SCRIPTS = ["grpo/oracle_selftest.py", "grpo/smoke_v2.py", "grpo/random_dbs_curve.py"]   # torchOptics 를 쓰는 실행 스크립트 — 고정 커밋 검사가 먼저 와야 한다
 EVAL_FILES = ["test_grpo.py", "eval_checkpoints.py"]
 
@@ -500,7 +500,8 @@ def main():
     blk = blk[:blk.index("\n    ),")]
     v2_keys = set(re.findall(r"^\s+([a-z_]+)=", blk, re.M))
     tr = read("grpo/trainer_v2.py")
-    used = set(re.findall(r'cfg\["([a-z_]+)"\]', tr)) | set(re.findall(r'v2\["([a-z_]+)"\]', src))
+    used = (set(re.findall(r'cfg\["([a-z_]+)"\]', tr)) | set(re.findall(r'v2\["([a-z_]+)"\]', src))
+            | set(re.findall(r'cfg\["v2"\]\["([a-z_]+)"\]', src)))
     check(not (used - v2_keys), f"코드가 읽는 v2 키가 CONFIG['v2'] 에 전부 있음 (없는 키: {sorted(used - v2_keys)})")
     check(not (v2_keys - used), f"CONFIG['v2'] 키 {len(v2_keys)}개를 코드가 전부 읽음 (안 읽는 키: {sorted(v2_keys - used)})")
     sm = read("grpo/smoke_v2.py")

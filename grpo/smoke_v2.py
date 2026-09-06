@@ -23,6 +23,7 @@ from grpo.oracle import FlipOracle
 from grpo.features import build_features, num_channels
 from grpo.policies import make_policy, count_params, POLICY_KINDS
 from grpo.dbs_state import DBSImage
+from grpo.val_states import build_val_states
 from grpo.trainer_v2 import GRPOTrainerV2
 
 IPS, CH = 64, 4      # 작은 크기 (실제는 256, 8)
@@ -80,9 +81,11 @@ for spec in ("legacy", "field"):
 cfg = dict(policy_kind="unet", feature_spec="field", state_gate=True, objective="grpo", reward_transform="relu",
            adv_baseline="sample", images_per_batch=2, group_size=16, steps_per_image=5, update_epochs=1,
            minibatch_states=2, lr=1e-3, clip_range=0.2, kl_coef=0.04, max_grad_norm=0.5, ref_update_iters=2,
-           entropy_coef=0.0, nonfinite_limit=20, adv_std_floor_rel=0.0, advance="best", num_iters=4, val_images=2, val_advance_steps=3, val_every=2,
+           entropy_coef=0.0, nonfinite_limit=20, adv_std_floor_rel=0.0, advance="best", num_iters=4, val_images=2,
+           val_depths=(0, 3), val_cache_dir=None, val_every=2, spawn_depth_max=3, run_tag="",
            save_every=4, startup_check=False, unet_base=8, fno_hidden=4)
 tmp = tempfile.mkdtemp(prefix="grpo_v2_smoke_")
+cfg["val_cache_dir"] = os.path.join(tmp, "val_cache")
 try:
     for objective, baseline, advance, transform in (("grpo", "sample", "best", "relu"), ("grpo", "policy", "sample", "raw"),
                                                     ("exact", "uniform", "best", "relu")):
@@ -90,15 +93,8 @@ try:
         feats_ch = num_channels(cfg["feature_spec"], CH)
         pol = make_policy(cfg["policy_kind"], feats_ch, CH, IPS, feature_spec=cfg["feature_spec"],
                           state_gate=cfg["state_gate"], unet_base=cfg["unet_base"])
-        vals = []
-        rng = np.random.default_rng(1)
-        for i in range(cfg["val_images"]):
-            Tv, hv, pv, _ = synth()
-            s = DBSImage(oracle, Tv, hv)
-            s.pre_model = pv
-            if i >= cfg["val_images"] // 2:
-                s.random_accept_steps(cfg["val_advance_steps"], rng)
-            vals.append(s)
+        vals = build_val_states(oracle, [synth() for _ in range(cfg["val_images"])], cfg["val_depths"], cfg["val_cache_dir"])
+        assert len(vals) == cfg["val_images"] * len(cfg["val_depths"]) and vals[1].depth == 3 and vals[1].flips <= 3
         tr = GRPOTrainerV2(pol, oracle, cfg, feature_spec=cfg["feature_spec"], new_image_fn=synth,
                            val_states=vals, device=device, log_dir=tmp)
         tr.extra_meta = {"policy_kind": cfg["policy_kind"], "feature_spec": cfg["feature_spec"],

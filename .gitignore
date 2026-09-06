@@ -3,6 +3,7 @@ dataset10/
 .ipynb_checkpoints/
 result/
 result_v/
+val_state_cache/          # 검증 상태 캐시 (grpo/val_states.py, 재생성 가능)
 .idea/
 *.ipynb1
 

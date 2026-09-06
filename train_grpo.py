@@ -88,11 +88,12 @@ CONFIG = {
         reward_transform="relu",    # "relu"(max(R,0): DBS 가 실제로 실현하는 스텝 이득 = 평가 지표와 같은 함수) | "raw"(비교 arm)
         adv_baseline="sample",      # "sample"(G 표본 통계 = DeepSeek GRPO 그대로) | "policy"(π_old 가중 모집단, G→∞ 극한) | "uniform"(균등 모집단)
         images_per_batch=8,         # K: 동시에 굴리는 이미지 수 (예: 4, 8, 16). 표본은 공짜지만 유효표본 수는 K 가 정한다
-        group_size=64,              # G: 상태당 정책 샘플 수 (예: 16, 64, 128)
-        steps_per_image=200,        # 이미지당 DBS 스텝 뒤 새 이미지로 교체 (예: 200, 600)
-        update_epochs=2,            # 반복당 epoch
-        minibatch_states=4,         # 미니배치에 넣는 상태 수 (GPU 메모리에 맞게)
-        lr=3e-4,
+        group_size=512,             # G: 상태당 정책 샘플 수 (예: 64, 512). 비용은 gather 뿐이라 반복 시간 불변, 상태 내 분산 1/8 (감사 2026-09-07; 1차 런 64)
+        spawn_depth_max=15000,      # 새 이미지를 받을 때 현재 정책으로 0~이 값 사이 무작위 깊이(스텝)까지 먼저 진행 (오라클 채택 판정). 0 = 진행 없음 (1차 런)
+        steps_per_image=5000,       # 스폰 뒤 이 이미지로 학습하는 스텝 수 (예: 200(1차 런), 5000). Random 곡선: 의미 있는 국면은 성공 1만~2만
+        update_epochs=1,            # 반복당 옵티마이저 스텝 수. 1 = DeepSeekMath μ=1 (ratio≡1, 순수 on-policy). 미니배치는 기울기 누적이라 스텝을 늘리지 않는다 (1차 런 2)
+        minibatch_states=4,         # 기울기 누적 단위(GPU 메모리에 맞게). 결과는 K 상태 전체 평균과 같다
+        lr=1e-4,                    # 1차 런 3e-4: 반복당 이동이 커 clipfrac 0.3~0.5·참조 대비 KL 4~6 nat. Adam 이동량 ∝ lr (감사)
         clip_range=0.2,
         kl_coef=0.04,
         max_grad_norm=0.5,
@@ -102,13 +103,15 @@ CONFIG = {
         adv_std_floor_rel=0.0,      # 표본 어드밴티지 std 하한 = 이 값 × 상태의 max R⁺. 0 = 없음(GRPO 그대로, 권장) | 예: 1e-3 (비교 arm). z-score 는 |A|≤√(G−1) 로 유계라 NaN 대책이 아님
         advance="best",             # 상태 전진: "best"(G 개 중 R>0 최고) | "sample"(정책 샘플 1개 — 시험 시와 같은 분포)
         num_iters=20000,            # 이번 실행에서 추가로 도는 반복 수 (재개 시 누적 아님)
-        val_images=8,               # 고정 검증 상태 수 V (검증 이미지 앞 V 장; 뒤 절반은 val_advance_steps 만큼 진행한 '중반 상태')
-        val_advance_steps=100,      # 검증 상태 절반을 무작위-채택 DBS 로 이만큼 진행
+        val_images=2,               # 검증 이미지 수 (앞 N 장). 검증 상태 수 = val_images × len(val_depths)
+        val_depths=(0, 2000, 5000, 10000, 20000),   # 검증 상태 깊이(오라클 탐욕 채택 플립 수). 디스크 캐시라 1회만 비용 (이미지당 ≈2.5분)
+        val_cache_dir="./val_state_cache/",        # 검증 상태 캐시 폴더 (git 무시). 초기 홀로그램 해시가 키라 모델이 바뀌면 자동 재생성
         val_every=50,
         save_every=500,
         startup_check=True,         # 시작 시 첫 상태에서 오라클 vs 실제 시뮬레이션 8픽셀 대조. 불일치면 죽는다 (폴백 없음)
         unet_base=32,               # unet 폭 (예: 16, 32)
         fno_hidden=16,              # fno 트렁크 폭
+        run_tag="r2",              # 산출물 폴더 접미사: grpo_models_v2_<policy_kind>_<run_tag>/. "" = 1차 런 폴더 (grpo_models_v2_unet/)
     ),
     # --- 실행 ---
     "num_episodes": 8000,
@@ -722,7 +725,8 @@ if __name__ == '__main__':
     # 파일에서 켠 스위치는 접미사로 붙인다 (주입으로 켠 것은 아래 sweep 이름의 축에 이미 들어간다).
     switch_suffix = (("_maskfix" if cfg["mask_in_update"] and "mask_in_update" not in overrides else "")
                      + (f"_seed{cfg['seed']}" if cfg["seed"] is not None and "seed" not in overrides else "")
-                     + (f"_v2_{cfg['v2']['policy_kind']}" if cfg["trainer"] == "v2" and "trainer" not in overrides else ""))
+                     + (f"_v2_{cfg['v2']['policy_kind']}" if cfg["trainer"] == "v2" and "trainer" not in overrides else "")
+                     + (f"_{cfg['v2']['run_tag']}" if cfg["trainer"] == "v2" and cfg["v2"]["run_tag"] and "v2.run_tag" not in overrides else ""))
     base_dir = cfg["save_dir"].rstrip("/\\") + switch_suffix
     if "save_dir" in overrides:
         # 앞 셀이 save_dir 을 직접 준 경우 — 스윕 arm 을 이어서 돌릴 때 쓴다. 그대로 쓴다.
@@ -813,19 +817,15 @@ if __name__ == '__main__':
                 T, path = next(_train_iter[0])
             return _prep(T, path)
 
-        # 검증 상태: 검증 이미지 앞 V 장의 초기 홀로그램. 뒤 절반은 무작위-채택 DBS 로 val_advance_steps 진행한 '중반 상태'.
-        val_states = []
+        # 검증 상태: 검증 앞 val_images 장을 오라클 탐욕으로 val_depths 깊이까지 진행시킨 고정 상태 (디스크 캐시, 첫 실행만 수 분)
+        from grpo.val_states import build_val_states
         _val_iter = iter(valid_loader)
-        _val_rng = np.random.default_rng(0)
-        for i in range(v2["val_images"]):
+        _val_imgs = []
+        for _ in range(v2["val_images"]):
             T, path = next(_val_iter)
-            Tv, h0, pre, name = _prep(T, path)
-            s = DBSImage(oracle, Tv, h0, name=name)
-            s.pre_model = pre
-            if i >= v2["val_images"] // 2 and v2["val_advance_steps"] > 0:
-                s.random_accept_steps(v2["val_advance_steps"], _val_rng)
-            val_states.append(s)
-        print(f"[v2] val states: {len(val_states)} (뒤 {len(val_states) - v2['val_images'] // 2}개는 {v2['val_advance_steps']}스텝 진행 상태)")
+            _val_imgs.append(_prep(T, path))
+        val_states = build_val_states(oracle, _val_imgs, v2["val_depths"], v2["val_cache_dir"])
+        print(f"[v2] val states: {len(val_states)} (이미지 {v2['val_images']}장 × 깊이 {tuple(v2['val_depths'])})")
 
         in_ch = num_channels(v2["feature_spec"], CH)
         policy = make_policy(v2["policy_kind"], in_ch, CH, IPS, feature_spec=v2["feature_spec"], state_gate=v2["state_gate"],

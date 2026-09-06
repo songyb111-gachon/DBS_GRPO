@@ -216,7 +216,7 @@ def make_random_action_fn():
 
 
 def run_dbs(state, pre_model, target_image, target_image_np,
-            max_steps, select_action_fn):
+            max_steps, select_action_fn, step_marks=(), success_marks=()):
     state = state.copy()
     state_record = np.zeros_like(state)
 
@@ -225,6 +225,7 @@ def run_dbs(state, pre_model, target_image, target_image_np,
     recon_np = recon.cpu().numpy()
 
     flip_count = 0
+    at_step, at_success = {}, {}      # 구간 표용: 스텝/성공 수 지점의 PSNR↑
 
     for step in range(1, max_steps + 1):
         obs = {
@@ -250,10 +251,15 @@ def run_dbs(state, pre_model, target_image, target_image_np,
             recon_np = recon_after.cpu().numpy()
             state_record[0, ch, row, col] += 1
             flip_count += 1
+            if flip_count in success_marks and flip_count not in at_success:
+                at_success[flip_count] = current_psnr - initial_psnr
         else:
             state[0, ch, row, col] = 1 - state[0, ch, row, col]
+        if step in step_marks:
+            at_step[step] = current_psnr - initial_psnr
 
     return {
+        "at_step": at_step, "at_success": at_success,
         "initial_psnr": initial_psnr,
         "final_psnr": current_psnr,
         "psnr_diff": current_psnr - initial_psnr,
@@ -289,7 +295,9 @@ if __name__ == '__main__':
     # ║                    여기만 수정하세요                      ║
     # ╚══════════════════════════════════════════════════════════╝
     MODEL_DIR       = "./grpo_models_v2_unet/"          # 체크포인트 폴더 경로 (v1: "./grpo_models/")
-    MAX_STEPS       = 500                               # 이미지당 DBS 스텝 수 (작을수록 빠름)
+    MAX_STEPS       = 20000                             # 이미지당 DBS 스텝 수. Random 곡선(+2~3 dB 에 10만~20만 시도) 기준 '의미 있는 국면'. 1차 평가는 500 (예: 500, 20000)
+    STEP_MARKS      = (500, 2000, 5000, 10000, 20000)   # 이 스텝에서의 PSNR↑ 를 표로 (MAX_STEPS 이하만 의미)
+    SUCCESS_MARKS   = (1000, 2000, 5000, 10000)         # 성공(채택) 횟수가 여기 닿았을 때의 PSNR↑ 를 표로 (같은 성공 수 비교)
     NUM_EVAL_IMAGES = 10                                # 평가에 사용할 이미지 수 (0 = 전체)
     EVAL_DIR        = '/nfs/dataset/DIV2K/DIV2K_valid_HR/DIV2K_valid_HR/'  # 평가 데이터셋 경로
     INCLUDE_RANDOM_BASELINE = True    # True: 같은 이미지·스텝으로 Random DBS 를 1회 돌려 기준선 행을 표·CSV 에 추가 (episode=0, checkpoint=random_baseline)
@@ -299,7 +307,7 @@ if __name__ == '__main__':
                             #   같은 이미지로 고르고 보고하면 최고값이 위로 치우친다 -> 본 실험 보고는 select 로 고르고 report 로 보고한다
     SELECT_N   = 20         # EVAL_SPLIT 이 select/report 일 때의 경계 (NUM_EVAL_IMAGES 는 그 전에 적용)
     EVAL_SEEDS = None       # None: 지금처럼 시드 미고정 1회 | (0, 1, 2): 시드마다 전체를 반복해 평균과 시드 간 표준편차 열(±std)을 표·CSV 에 추가
-    CHECKPOINT_SELECT = None   # None: 폴더의 체크포인트 전부 | (4500, 12000, 24500): 이 반복(v1 은 에피소드) 번호만. 체크포인트 49개를 다 돌리면 이미지 10장×500스텝에도 1시간 가까이 든다
+    CHECKPOINT_SELECT = "every:5000"   # None: 전부 | "every:5000": 반복 번호가 5000 의 배수인 것만 | (4500, 12000, 24500): 이 번호만. 2만 스텝이면 체크포인트당 ≈25분
     # ════════════════════════════════════════════════════════════
 
     meta = {'wl': 515e-9, 'dx': (7.56e-6, 7.56e-6)}
@@ -372,7 +380,13 @@ if __name__ == '__main__':
     if not checkpoints:
         print(f"No checkpoints found in {MODEL_DIR}")
         sys.exit(1)
-    if CHECKPOINT_SELECT is not None:
+    if isinstance(CHECKPOINT_SELECT, str) and CHECKPOINT_SELECT.startswith("every:"):
+        _every = int(CHECKPOINT_SELECT.split(":")[1])
+        checkpoints = [(e, p) for e, p in checkpoints if e % _every == 0]
+        if not checkpoints:
+            raise ValueError(f"CHECKPOINT_SELECT={CHECKPOINT_SELECT!r} 에 맞는 체크포인트가 없다")
+        print(f"CHECKPOINT_SELECT: {len(checkpoints)}개만 평가 (반복 번호 {_every} 의 배수)")
+    elif CHECKPOINT_SELECT is not None:
         wanted = set(int(x) for x in CHECKPOINT_SELECT)
         missing = sorted(wanted - {e for e, _ in checkpoints})
         if missing:
@@ -412,6 +426,7 @@ if __name__ == '__main__':
                     target_image_np=img["target_image_np"],
                     max_steps=MAX_STEPS,
                     select_action_fn=make_action_fn(),
+                    step_marks=STEP_MARKS, success_marks=SUCCESS_MARKS,
                 ))
             per_seed.append(results)
         diffs = [np.mean([r["psnr_diff"] for r in rs]) for rs in per_seed]
@@ -422,6 +437,10 @@ if __name__ == '__main__':
             "avg_success_ratio": float(np.mean([r["success_ratio"] for r in flat])),
             "avg_flip_count": float(np.mean([r["flip_count"] for r in flat])),
             "per_image": per_seed[0],
+            "at_step": {m: float(np.mean([r["at_step"][m] for r in flat if m in r["at_step"]])) if any(m in r["at_step"] for r in flat) else float("nan")
+                        for m in STEP_MARKS},
+            "at_success": {m: (float(np.mean([r["at_success"][m] for r in flat if m in r["at_success"]])) if any(m in r["at_success"] for r in flat) else float("nan"),
+                            sum(1 for r in flat if m in r["at_success"]), len(flat)) for m in SUCCESS_MARKS},
         }
 
     def print_row(name, ep, res, elapsed):
@@ -497,6 +516,19 @@ if __name__ == '__main__':
             rec = r["avg_psnr_diff"] / orc["avg_psnr_diff"] if orc["avg_psnr_diff"] > 0 else float("nan")
             print(f"      ep{r['episode']:>5}: {rec:.1%}   ({r['time'] / n_steps * 1000:.1f} ms/스텝)")
 
+    # --- 구간 표: 같은 스텝 수 / 같은 성공 수에서의 PSNR↑ (Random 곡선과 대조하는 '의미 있는 국면' 판정) ---
+    marks = [m for m in STEP_MARKS if m <= MAX_STEPS]
+    if marks:
+        print(f"\n  스텝 구간별 PSNR↑ (이미지 평균):")
+        print(f"    {'':<22}" + "".join(f"{('step ' + str(m)):>12}" for m in marks))
+        for r in all_results:
+            print(f"    {os.path.basename(r['checkpoint']):<22}" + "".join(f"{r['at_step'].get(m, float('nan')):>+12.4f}" for m in marks))
+    print(f"\n  성공 횟수 도달 시 PSNR↑ (이미지 평균, 괄호 = 도달 이미지 수):")
+    print(f"    {'':<22}" + "".join(f"{('succ ' + str(m)):>16}" for m in SUCCESS_MARKS))
+    for r in all_results:
+        print(f"    {os.path.basename(r['checkpoint']):<22}" + "".join(
+            f"{r['at_success'][m][0]:>+11.4f}({r['at_success'][m][1]:>2})" for m in SUCCESS_MARKS))
+
     # --- 결과 CSV 저장 ---
     result_dir = f"./eval_results/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}/"
     os.makedirs(result_dir, exist_ok=True)
@@ -521,6 +553,14 @@ if __name__ == '__main__':
                         f"{img_r['psnr_diff']:.6f},{img_r['flip_count']},"
                         f"{img_r['success_ratio']:.6f}\n")
 
+    with open(os.path.join(result_dir, "trajectory_marks.csv"), "w") as f:
+        f.write("episode,checkpoint," + ",".join(f"step{m}" for m in STEP_MARKS) + ","
+                + ",".join(f"succ{m},succ{m}_n" for m in SUCCESS_MARKS) + "\n")
+        for r in all_results:
+            f.write(f"{r['episode']},{os.path.basename(r['checkpoint'])},"
+                    + ",".join(f"{r['at_step'].get(m, float('nan')):.6f}" for m in STEP_MARKS) + ","
+                    + ",".join(f"{r['at_success'][m][0]:.6f},{r['at_success'][m][1]}" for m in SUCCESS_MARKS) + "\n")
     print(f"\n  Results saved to: {result_dir}")
+    print(f"  - trajectory_marks.csv       (스텝/성공 수 구간별 PSNR↑)")
     print(f"  - checkpoint_comparison.csv  (체크포인트별 요약)")
     print(f"  - per_image_detail.csv       (이미지별 상세)")
