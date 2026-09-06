@@ -20,6 +20,7 @@
      충돌 가드가 있는지, FORCED_KEYS 가 CONFIG 잎에 실재하는지, 축이 다르면 이름이 다른지, 주입이 없으면 이름을 안 바꾸는 분기
 """
 import ast
+import builtins
 import json
 import os
 import sys
@@ -247,6 +248,88 @@ def init_params(src, classname):
     return [a.arg for a in node.args.args[1:]] + [a.arg for a in node.args.kwonlyargs]
 
 
+# ------------------------------------------------------------------ 11. 미정의 이름 (AST)
+# py_compile 은 NameError 를 못 잡는다. 서버에서만 처음 도는 코드가 미정의 이름으로 죽어 왕복이 든 적이 있어
+# (grpo/oracle.py env_style_psnr 의 z) 의존성 없이 스코프를 따라가는 검사를 둔다. 정밀도를 우선한다: 잡히면 진짜다.
+_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef,
+                ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+_BUILTIN_NAMES = set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__builtins__", "__spec__", "__loader__",
+                                       "__package__", "get_ipython", "display", "exit", "quit"}
+
+
+def _name_targets(node):
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _scope_bindings(node, is_root=True):
+    """이 스코프에서 바인딩되는 이름. 중첩 스코프(함수/클래스/람다/컴프리헨션) 내부는 제외하되 그 이름 자체는 포함."""
+    out = set()
+    if is_root:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            a = node.args
+            for arg in a.posonlyargs + a.args + a.kwonlyargs:
+                out.add(arg.arg)
+            if a.vararg:
+                out.add(a.vararg.arg)
+            if a.kwarg:
+                out.add(a.kwarg.arg)
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            for gen in node.generators:
+                out |= _name_targets(gen.target)
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(child.name)
+            continue
+        if isinstance(child, _SCOPE_NODES):
+            continue
+        if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
+            out.add(child.id)
+        elif isinstance(child, (ast.Import, ast.ImportFrom)):
+            for alias in child.names:
+                out.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(child, ast.ExceptHandler) and child.name:
+            out.add(child.name)
+        elif isinstance(child, (ast.Global, ast.Nonlocal)):
+            out |= set(child.names)
+        out |= _scope_bindings(child, is_root=False)
+    return out
+
+
+def _check_loads(node, chain, out):
+    """chain: 안쪽부터 바깥쪽으로 (bound_set, is_class). 함수/컴프리헨션에서는 클래스 스코프가 안 보인다."""
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, _SCOPE_NODES):
+            b = _scope_bindings(child)
+            inner = [(b, True)] + chain if isinstance(child, ast.ClassDef) else [(b, False)] + [c for c in chain if not c[1]]
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                for d in child.decorator_list:                       # 데코레이터·기본값은 바깥 스코프에서 평가
+                    _check_loads_expr(d, chain, out)
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                for d in child.args.defaults + [x for x in child.args.kw_defaults if x is not None]:
+                    _check_loads_expr(d, chain, out)
+            _check_loads(child, inner, out)
+            continue
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+            if child.id not in _BUILTIN_NAMES and not any(child.id in b for b, _ in chain):
+                out.append((child.lineno, child.id))
+        _check_loads(child, chain, out)
+
+
+def _check_loads_expr(expr, chain, out):
+    if isinstance(expr, ast.Name) and isinstance(expr.ctx, ast.Load):
+        if expr.id not in _BUILTIN_NAMES and not any(expr.id in b for b, _ in chain):
+            out.append((expr.lineno, expr.id))
+    _check_loads(expr, chain, out)
+
+
+def undefined_names(src):
+    """모듈 소스에서 어느 스코프에서도 바인딩되지 않은 채 읽히는 이름 [(줄, 이름)]."""
+    tree = ast.parse(src)
+    out = []
+    _check_loads(tree, [(_scope_bindings(tree), False)], out)
+    return sorted(set(out))
+
+
 def main():
     print("== 1. torchOptics 고정 커밋 ==")
     try:
@@ -402,6 +485,12 @@ def main():
         has_branch = any(isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == "overrides"
                          for n in ast.walk(tree))
         check(has_branch, "주입 여부(overrides)로 save_dir 을 가르는 if 분기가 코드에 있음 (주입 없으면 예전 경로)")
+
+    print("== 11. 미정의 이름 (AST, 모든 모듈) ==")
+    for f in ENTRY_SCRIPTS + GRPO_PKG + ["env.py", "optics_constants.py", "grpo/oracle_algebra_check_np.py",
+                                        "utils/logger.py", "utils/overrides.py", "utils/torchoptics_pin.py", "check_conventions.py"]:
+        u = undefined_names(read(f))
+        check(not u, f"{f}: 미정의 이름 없음" + (f" - 위반 {u}" if u else ""))
 
     print()
     print(f"통과 {_passes}, 실패 {len(_failures)}")

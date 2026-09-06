@@ -159,7 +159,7 @@ def env_style_psnr(binary, target):
     검증·기준선용. binary: (1, C, n, n) float, target: (1, 1, n, n). 반환 (psnr_float32경로, sim, result)."""
     import torchOptics.metrics as tm
     b = tt.Tensor(binary, meta=OPTICS_META)
-    sim = tt.simulate(b, z).abs() ** 2
+    sim = tt.simulate(b, PROP_Z).abs() ** 2
     result = torch.mean(sim, dim=1, keepdim=True)
     return float(tt.relativeLoss(result, target, tm.get_PSNR)), sim, result
 
