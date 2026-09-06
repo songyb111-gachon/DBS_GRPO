@@ -65,6 +65,7 @@ class GRPOTrainerV2:
         self.log_dir = log_dir
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=cfg["lr"])
         self.iteration = 0
+        self.nonfinite_skips = 0   # 비유한 손실/기울기로 버린 미니배치 누적 (nonfinite_limit 에서 죽는다)
         self.extra_meta = {}      # policy_kind / feature_spec / in_channels / state_gate / config — 호출측이 채운다
         self.images = [self._spawn() for _ in range(cfg["images_per_batch"])]
         # 검증 상태의 오라클 지도는 상태가 고정이라 한 번만
@@ -108,14 +109,23 @@ class GRPOTrainerV2:
             feats = self._features(img)
             with torch.no_grad():
                 logits = self.policy(feats).squeeze(0)               # (N,)
+                if not torch.isfinite(logits).all():
+                    bad = [n for n, p in self.policy.named_parameters() if not torch.isfinite(p).all()]
+                    raise RuntimeError(f"[v2] 정책 로짓에 비유한 값 (iter {self.iteration}, image={img.name}, feats finite="
+                                       f"{bool(torch.isfinite(feats).all())}, 비유한 파라미터 {len(bad)}개: {bad[:5]}) - 폴백 없음")
                 dist = torch.distributions.Categorical(logits=logits)
                 actions = dist.sample((G,))                          # (G,)
                 old_logp = dist.log_prob(actions)
                 R_all = img.reward_map().reshape(-1)                 # (N,) 원시 ΔPSNR
+                if not torch.isfinite(R_all).all():
+                    raise RuntimeError(f"[v2] 오라클 지도에 비유한 값 (image={img.name}, steps={img.steps}, psnr={img.psnr:.4f}, "
+                                       f"mse={img.mse:.3e}, mean(T)={float(img.T.mean()):.4f}) - 폴백 없음")
                 Rp_all = self._transform(R_all)
                 R = R_all[actions]
                 Rp = Rp_all[actions]
                 m, s = self._baseline(Rp_all, Rp, dist.probs)
+                if self.cfg["adv_std_floor_rel"] > 0:                # 정책이 뾰족해져 표본이 겹치면 std 가 붕괴해 A 가 폭주한다
+                    s = torch.maximum(s, self.cfg["adv_std_floor_rel"] * Rp_all.max())
                 adv = (Rp - m) / (s + 1e-12)
                 adv_map = (Rp_all - m) / (s + 1e-12) if self.cfg["objective"] == "exact" else None
             batch.append({"feats": feats, "actions": actions, "old_logp": old_logp, "adv": adv,
@@ -123,10 +133,23 @@ class GRPOTrainerV2:
         self.policy.train()
         return batch
 
+    def _skip(self, items, why):
+        """비유한 손실/기울기: 이 미니배치의 스텝을 버리고 진단을 찍는다. 누적이 nonfinite_limit 에 닿으면 죽는다
+        (조용히 건너뛰며 몇 시간 도는 것보다 낫다)."""
+        self.nonfinite_skips += 1
+        names = [it["img"].name for it in items]
+        adv_max = max(float(it["adv"].abs().max()) for it in items)
+        fin = {k: all(bool(torch.isfinite(it[k]).all()) for it in items) for k in ("feats", "R", "adv", "old_logp")}
+        print(f"  [v2] 비유한 값으로 미니배치 건너뜀 (iter {self.iteration}, 누적 {self.nonfinite_skips}/{self.cfg['nonfinite_limit']}): "
+              f"{why}; |adv|max={adv_max:.3e}, finite={fin}, images={names}")
+        if self.nonfinite_skips >= self.cfg["nonfinite_limit"]:
+            raise RuntimeError(f"[v2] 비유한 손실/기울기가 {self.nonfinite_skips}회 누적 - 학습을 멈춘다. "
+                               "lr / kl_coef / ref_update_iters / adv_std_floor_rel 을 볼 것")
+
     def update(self, batch):
         cfg = self.cfg
         E, M = cfg["update_epochs"], cfg["minibatch_states"]
-        stats = {"loss": [], "pg": [], "kl": [], "clipfrac": [], "entropy": []}
+        stats = {"loss": [], "pg": [], "kl": [], "clipfrac": [], "entropy": [], "gnorm": []}
         idx = list(range(len(batch)))
         for _ in range(E):
             np.random.shuffle(idx)
@@ -161,12 +184,20 @@ class GRPOTrainerV2:
                 ent = torch.stack(ent_terms).mean()
                 loss = pg + cfg["kl_coef"] * kl - cfg["entropy_coef"] * ent
                 if not torch.isfinite(loss):
-                    print(f"  [v2] non-finite loss at iter {self.iteration}: pg={pg.item()} kl={kl.item()} - 이 미니배치 건너뜀")
+                    self._skip(items, f"loss 비유한: pg={pg.item()} kl={kl.item()} ent={ent.item()} "
+                                      f"logits finite={bool(torch.isfinite(logits).all())}")
                     continue
                 self.optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), cfg["max_grad_norm"])
+                gnorm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), cfg["max_grad_norm"])
+                if not torch.isfinite(gnorm):
+                    # 기울기에 inf 가 하나라도 있으면 clip 계수가 0 이 되고 inf×0 = NaN 이 파라미터로 들어간다.
+                    # 실제 사고(iter 4927 손실 NaN 2회 → 4928 스텝 → 4929 로짓 NaN 크래시)가 이 경로였다. 스텝을 버린다.
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self._skip(items, f"grad norm={float(gnorm)} (loss={loss.item():+.4f})")
+                    continue
                 self.optimizer.step()
+                stats["gnorm"].append(float(gnorm))
                 stats["loss"].append(loss.item()); stats["pg"].append(pg.item()); stats["kl"].append(kl.item())
                 stats["clipfrac"].append(torch.stack(clip_terms).mean().item()); stats["entropy"].append(ent.item())
         return {k: (float(np.mean(v)) if v else float("nan")) for k, v in stats.items()}
@@ -221,11 +252,13 @@ class GRPOTrainerV2:
             t0 = time.time()
             batch = self.collect()
             st = self.update(batch)
+            if not all(bool(torch.isfinite(p).all()) for p in self.policy.parameters()):
+                raise RuntimeError(f"[v2] iter {self.iteration + 1}: 정책 파라미터에 비유한 값 - 체크포인트를 남기지 않고 멈춘다")
             acc, rep = self.advance(batch)
             self.iteration += 1
             R_cat = torch.cat([it["R"] for it in batch])
             print(f"[v2 it {self.iteration}] loss={st['loss']:+.4f} pg={st['pg']:+.4f} kl={st['kl']:.4f} "
-                  f"clip={st['clipfrac']:.2f} H={st['entropy']:.2f} | sampled R: mean={float(R_cat.mean()):+.2e} "
+                  f"clip={st['clipfrac']:.2f} gn={st['gnorm']:.2f} H={st['entropy']:.2f} | sampled R: mean={float(R_cat.mean()):+.2e} "
                   f"P>0={float((R_cat > 0).float().mean()):.2%} | advance acc={acc}/{len(batch)} new_img={rep} "
                   f"| psnr_gain(avg)={np.mean([it['img'].gain for it in batch]):+.4f} | {time.time() - t0:.1f}s")
             if self.cfg["ref_update_iters"] > 0 and self.iteration % self.cfg["ref_update_iters"] == 0:

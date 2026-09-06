@@ -288,12 +288,12 @@ if __name__ == '__main__':
     # ╔══════════════════════════════════════════════════════════╗
     # ║                    여기만 수정하세요                      ║
     # ╚══════════════════════════════════════════════════════════╝
-    MODEL_DIR       = "./grpo_models/"                  # 체크포인트 폴더 경로
+    MODEL_DIR       = "./grpo_models_v2_unet/"          # 체크포인트 폴더 경로 (v1: "./grpo_models/")
     MAX_STEPS       = 500                               # 이미지당 DBS 스텝 수 (작을수록 빠름)
     NUM_EVAL_IMAGES = 10                                # 평가에 사용할 이미지 수 (0 = 전체)
     EVAL_DIR        = '/nfs/dataset/DIV2K/DIV2K_valid_HR/DIV2K_valid_HR/'  # 평가 데이터셋 경로
-    INCLUDE_RANDOM_BASELINE = False   # True: 같은 이미지·스텝으로 Random DBS 를 1회 돌려 기준선 행을 표·CSV 에 추가 (episode=0, checkpoint=random_baseline)
-    INCLUDE_ORACLE_GREEDY   = False   # True: 오라클 탐욕 DBS(매 스텝 실제 최선 픽셀)를 상한 기준선으로 추가 (episode=-1, checkpoint=oracle_greedy). grpo/oracle_selftest.py 통과 후에만
+    INCLUDE_RANDOM_BASELINE = True    # True: 같은 이미지·스텝으로 Random DBS 를 1회 돌려 기준선 행을 표·CSV 에 추가 (episode=0, checkpoint=random_baseline)
+    INCLUDE_ORACLE_GREEDY   = True    # True: 오라클 탐욕 DBS(매 스텝 실제 최선 픽셀)를 상한 기준선으로 추가 (episode=-1, checkpoint=oracle_greedy). grpo/oracle_selftest.py 통과 후에만
     BASELINE_NAMES = ("random_baseline", "oracle_greedy")
     EVAL_SPLIT = "all"     # "all"(지금까지와 같음) | "select"(앞 SELECT_N 장: 체크포인트 고르기용) | "report"(나머지: 고른 체크포인트 보고용)
                             #   같은 이미지로 고르고 보고하면 최고값이 위로 치우친다 -> 본 실험 보고는 select 로 고르고 report 로 보고한다

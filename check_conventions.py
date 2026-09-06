@@ -23,6 +23,7 @@ import ast
 import builtins
 import json
 import os
+import re
 import sys
 
 # Windows 기본 콘솔(cp949)에서 라벨의 특수문자로 죽지 않게. 메시지 인코딩 문제로 검사기가 멈추면 안 된다.
@@ -491,6 +492,20 @@ def main():
                                         "utils/logger.py", "utils/overrides.py", "utils/torchoptics_pin.py", "check_conventions.py"]:
         u = undefined_names(read(f))
         check(not u, f"{f}: 미정의 이름 없음" + (f" - 위반 {u}" if u else ""))
+
+    print("== 12. CONFIG['v2'] 키 <-> trainer_v2/train_grpo 참조 <-> grpo/smoke_v2.py cfg (손복사본) ==")
+    src = read("train_grpo.py")
+    blk = src[src.index('"v2": dict('):]
+    blk = blk[:blk.index("
+    ),")]
+    v2_keys = set(re.findall(r"^\s+([a-z_]+)=", blk, re.M))
+    tr = read("grpo/trainer_v2.py")
+    used = set(re.findall(r'cfg\["([a-z_]+)"\]', tr)) | set(re.findall(r'v2\["([a-z_]+)"\]', src))
+    check(not (used - v2_keys), f"코드가 읽는 v2 키가 CONFIG['v2'] 에 전부 있음 (없는 키: {sorted(used - v2_keys)})")
+    check(not (v2_keys - used), f"CONFIG['v2'] 키 {len(v2_keys)}개를 코드가 전부 읽음 (안 읽는 키: {sorted(v2_keys - used)})")
+    sm = read("grpo/smoke_v2.py")
+    missing = sorted(k for k in v2_keys if k + "=" not in sm)
+    check(not missing, f"grpo/smoke_v2.py 의 cfg 가 CONFIG['v2'] 키를 전부 가짐 (빠진 키: {missing})")
 
     print()
     print(f"통과 {_passes}, 실패 {len(_failures)}")

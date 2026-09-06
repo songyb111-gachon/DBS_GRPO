@@ -98,6 +98,8 @@ CONFIG = {
         max_grad_norm=0.5,
         ref_update_iters=50,        # π_ref 갱신 주기(반복). 0 = 고정 참조(초기 정책 = 엔트로피 정규화 해석). v1 과 같은 이동 참조가 기본
         entropy_coef=0.0,           # 엔트로피 보너스. A 가 z-score 라 0.01 이하는 거의 무의미 (예: 0, 0.05, 0.2)
+        nonfinite_limit=20,         # 비유한 손실/기울기로 버린 미니배치의 누적 상한. 닿으면 죽는다 (iter 4927~4929 NaN 사고 이후 추가)
+        adv_std_floor_rel=0.0,      # 표본 어드밴티지 std 하한 = 이 값 × 상태의 max R⁺. 0 = 없음(GRPO 그대로) | 예: 1e-3 (뾰족한 정책에서 표본이 겹쳐 std 가 붕괴할 때)
         advance="best",             # 상태 전진: "best"(G 개 중 R>0 최고) | "sample"(정책 샘플 1개 — 시험 시와 같은 분포)
         num_iters=20000,            # 이번 실행에서 추가로 도는 반복 수 (재개 시 누적 아님)
         val_images=8,               # 고정 검증 상태 수 V (검증 이미지 앞 V 장; 뒤 절반은 val_advance_steps 만큼 진행한 '중반 상태')
