@@ -40,8 +40,9 @@ ENTRY_SCRIPTS = [
 ]
 GRPO_FILES = ["train_grpo.py", "test_grpo.py", "eval_checkpoints.py"]
 GRPO_PKG = ["grpo/oracle.py", "grpo/features.py", "grpo/policies.py", "grpo/dbs_state.py", "grpo/trainer_v2.py",
-            "grpo/eval_utils.py", "grpo/oracle_selftest.py", "grpo/smoke_v2.py"]
-GRPO_SCRIPTS = ["grpo/oracle_selftest.py", "grpo/smoke_v2.py"]   # torchOptics 를 쓰는 실행 스크립트 — 고정 커밋 검사가 먼저 와야 한다
+            "grpo/eval_utils.py", "grpo/oracle_selftest.py", "grpo/smoke_v2.py", "grpo/data_prep.py", "grpo/val_summary.py",
+            "grpo/random_dbs_curve.py"]
+GRPO_SCRIPTS = ["grpo/oracle_selftest.py", "grpo/smoke_v2.py", "grpo/random_dbs_curve.py"]   # torchOptics 를 쓰는 실행 스크립트 — 고정 커밋 검사가 먼저 와야 한다
 EVAL_FILES = ["test_grpo.py", "eval_checkpoints.py"]
 
 PRETRAINED_NAME = "2024-12-19 20:37:52.499731_pre_reinforce_8_0.002"
