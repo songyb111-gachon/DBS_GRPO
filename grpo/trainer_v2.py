@@ -71,6 +71,23 @@ class GRPOTrainerV2:
         # 검증 상태의 오라클 지도는 상태가 고정이라 한 번만
         self.val_maps = [s.reward_map().reshape(-1) for s in self.val_states]
         self.val_feats = [self._features(s) for s in self.val_states]
+        # 학습 중 DBS 판정: 평가 루프와 같은 절차(정책 샘플, 같은 상태에서 실패한 액션 마스킹, 채택 판정만 오라클)로 짧게 돌려 Random 과 비교.
+        # r2 에서 깊이별 스텝 지표(recovery, P_π)는 좋은데 DBS 성적은 나쁜 체크포인트(it40000)가 있었다 — 스텝 지표가 DBS 성적을 예측하지 못한다.
+        self.val_dbs_seeds, self.val_dbs_random = [], float("nan")
+        if cfg["val_dbs_every"] > 0:
+            if cfg["val_dbs_every"] % cfg["val_every"] != 0:
+                raise ValueError("v2.val_dbs_every 는 v2.val_every 의 배수여야 한다 (같은 val.jsonl 줄에 붙인다)")
+            self.val_dbs_seeds = [(s.T, s.h.clone(), s.pre_model, s.name) for s in self.val_states if int(getattr(s, "depth", 0)) == 0]
+            if not self.val_dbs_seeds:
+                raise ValueError("val_dbs 에는 깊이 0 인 검증 상태가 하나 이상 필요하다 (val_depths 에 0 포함)")
+            rng = np.random.default_rng(0)
+            gains = []
+            for T, h0, pre, name in self.val_dbs_seeds:                # Random 기준선: 복원 추출, 마스크 없음 (평가 스크립트의 Random 과 같음)
+                img = DBSImage(self.oracle, T, h0, name=name)
+                img.random_accept_steps(int(cfg["val_dbs_steps"]), rng)
+                gains.append(img.gain)
+            self.val_dbs_random = float(np.mean(gains))
+            print(f"[v2] val DBS 기준선: Random {cfg['val_dbs_steps']}스텝 = {self.val_dbs_random:+.4f} dB (검증 이미지 {len(self.val_dbs_seeds)}장)")
 
     # ---------------------------------------------------------------- 상태/특징
     def _spawn(self):
@@ -315,6 +332,37 @@ class GRPOTrainerV2:
                     out[f"{k}_d{d}"] = float(np.nanmean([r[k] for r in sel]))
         return out
 
+    @torch.no_grad()
+    def _policy_dbs(self, img, steps):
+        """평가 루프(eval_checkpoints.run_dbs + make_grpo_action_fn)와 같은 DBS: 정책에서 1개 샘플, 같은 상태에서 실패한 액션은 마스킹,
+        채택 판정은 오라클 지도(시뮬레이션과 1e-6 dB 이내). 반환 (gain, 채택 수)."""
+        self.policy.eval()
+        failed = torch.zeros(img.h.numel(), dtype=torch.bool, device=self.device)
+        acc = 0
+        for _ in range(int(steps)):
+            logits = self.policy(self._features(img)).squeeze(0).masked_fill(failed, -1e9)
+            a = int(torch.distributions.Categorical(logits=logits).sample())
+            if float(img.reward_map().reshape(-1)[a]) > 0:
+                img.apply(a)
+                acc += 1
+                failed.zero_()
+            else:
+                img.steps += 1
+                failed[a] = True
+        self.policy.train()
+        return img.gain, acc
+
+    def validate_dbs(self):
+        """깊이 0 검증 이미지에서 val_dbs_steps 스텝 DBS 를 정책으로 돌린 이득 (vs 시작 시 잰 Random 이득)."""
+        gains, accs = [], []
+        for T, h0, pre, name in self.val_dbs_seeds:
+            img = DBSImage(self.oracle, T, h0, name=name)
+            img.pre_model = pre
+            g, a = self._policy_dbs(img, self.cfg["val_dbs_steps"])
+            gains.append(g)
+            accs.append(a)
+        return {"dbs_gain": float(np.mean(gains)), "dbs_acc": float(np.mean(accs)), "dbs_random_gain": self.val_dbs_random}
+
     # ---------------------------------------------------------------- 루프
     def train(self, num_iters, save_dir, save_every, val_every):
         """num_iters 는 이번 실행에서 추가로 도는 반복 수 (재개 시 누적이 아님)."""
@@ -343,6 +391,12 @@ class GRPOTrainerV2:
                 print(f"  [v2] pi_ref <- pi at iter {self.iteration}")
             if self.iteration % val_every == 0:
                 v = self.validate()
+                if self.cfg["val_dbs_every"] > 0 and self.iteration % self.cfg["val_dbs_every"] == 0:
+                    t1 = time.time()
+                    v.update(self.validate_dbs())
+                    ratio = v["dbs_gain"] / v["dbs_random_gain"] if v["dbs_random_gain"] > 0 else float("nan")
+                    print(f"  [v2 dbs {self.iteration}] {self.cfg['val_dbs_steps']}스텝 DBS: 정책 {v['dbs_gain']:+.4f} dB (채택 {v['dbs_acc']:.0f}) "
+                          f"vs Random {v['dbs_random_gain']:+.4f} dB -> x{ratio:.2f} ({time.time() - t1:.0f}s)")
                 print(f"  [v2 val {self.iteration}] E_pi_relu={v['E_pi_relu']:+.3e} E_unif_relu={v['E_unif_relu']:+.3e} "
                       f"top1={v['top1']:+.3e} recovery={v['recovery']:.3f} | P_pi={v['P_pi']:.2%} P_unif={v['P_unif']:.2%} "
                       f"| E_pi_raw={v['E_pi_raw']:+.3e} E_unif_raw={v['E_unif_raw']:+.3e} argmax_R={v['R_argmax']:+.3e} "

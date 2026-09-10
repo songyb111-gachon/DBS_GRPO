@@ -50,6 +50,13 @@ def main():
                 rec, p, eff = r.get(f"recovery_d{d}"), r.get(f"P_pi_d{d}"), r.get(f"eff_support_d{d}")
                 cells.append(f"{rec:>6.3f} {p:>7.1%} {eff:>7.0f}" if rec is not None else f"{'-':>22}")
             print(f"{r['iter']:>7} " + " ".join(cells))
+    dbs_rows = [r for r in rows if "dbs_gain" in r]
+    if dbs_rows:
+        print(f"\n학습 중 DBS 판정 (깊이 0 검증 이미지, 정책 vs Random, 같은 스텝):")
+        print(f"{'iter':>7} {'policy':>9} {'random':>9} {'ratio':>6} {'acc':>6}")
+        for r in dbs_rows:
+            ratio = r['dbs_gain'] / r['dbs_random_gain'] if r['dbs_random_gain'] else float('nan')
+            print(f"{r['iter']:>7} {r['dbs_gain']:>+9.4f} {r['dbs_random_gain']:>+9.4f} {ratio:>6.2f} {r['dbs_acc']:>6.0f}")
     last = rows[-1]
     verdict = (last["E_pi_relu"] > last["E_unif_relu"] and last["recovery"] >= 0.1 and last["P_pi"] > last["P_unif"])
     print(f"\n마지막 줄 판정(PLAN §0 '학습됨', 전체 평균): {'충족' if verdict else '미충족'} "

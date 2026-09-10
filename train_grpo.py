@@ -89,7 +89,7 @@ CONFIG = {
         adv_baseline="sample",      # "sample"(G 표본 통계 = DeepSeek GRPO 그대로) | "policy"(π_old 가중 모집단, G→∞ 극한) | "uniform"(균등 모집단)
         images_per_batch=8,         # K: 동시에 굴리는 이미지 수 (예: 4, 8, 16). 표본은 공짜지만 유효표본 수는 K 가 정한다
         group_size=512,             # G: 상태당 정책 샘플 수 (예: 64, 512). 비용은 gather 뿐이라 반복 시간 불변, 상태 내 분산 1/8 (감사 2026-09-07; 1차 런 64)
-        spawn_depth_max=15000,      # 새 이미지를 받을 때 현재 정책으로 0~이 값 사이 무작위 깊이(스텝)까지 먼저 진행 (오라클 채택 판정). 0 = 진행 없음 (1차 런)
+        spawn_depth_max=10000,      # 새 이미지를 받을 때 현재 정책으로 0~이 값 사이 무작위 깊이(스텝)까지 먼저 진행 (오라클 채택 판정). 0 = 진행 없음 (1차 런). r2 15000: 평가가 닿는 깊이(채택 ≤4.4천)보다 훨씬 깊은 상태에 학습을 낭비
         steps_per_image=5000,       # 스폰 뒤 이 이미지로 학습하는 스텝 수 (예: 200(1차 런), 5000). Random 곡선: 의미 있는 국면은 성공 1만~2만
         update_epochs=1,            # 반복당 옵티마이저 스텝 수. 1 = DeepSeekMath μ=1 (ratio≡1, 순수 on-policy). 미니배치는 기울기 누적이라 스텝을 늘리지 않는다 (1차 런 2)
         minibatch_states=4,         # 기울기 누적 단위(GPU 메모리에 맞게). 결과는 K 상태 전체 평균과 같다
@@ -107,11 +107,13 @@ CONFIG = {
         val_depths=[0, 2000, 5000, 10000, 20000],   # 검증 상태 깊이(오라클 탐욕 채택 플립 수). 디스크 캐시라 1회만 비용 (이미지당 ≈2.5분). 리스트로 둔다 — JSON(overrides.json) 과 같은 표현
         val_cache_dir="./val_state_cache/",        # 검증 상태 캐시 폴더 (git 무시). 초기 홀로그램 해시가 키라 모델이 바뀌면 자동 재생성
         val_every=50,
+        val_dbs_steps=2000,         # 학습 중 DBS 판정: 깊이 0 검증 이미지에서 이 스텝만큼 평가 루프와 같은 DBS (정책 vs Random). 이미지당 ≈2000×9 ms
+        val_dbs_every=1000,         # 그 주기 (val_every 의 배수, 0 = 끔). 1000 이면 반복 1000당 ≈40 s 추가 (약 15%)
         save_every=500,
         startup_check=True,         # 시작 시 첫 상태에서 오라클 vs 실제 시뮬레이션 8픽셀 대조. 불일치면 죽는다 (폴백 없음)
         unet_base=32,               # unet 폭 (예: 16, 32)
         fno_hidden=16,              # fno 트렁크 폭
-        run_tag="r2",              # 산출물 폴더 접미사: grpo_models_v2_<policy_kind>_<run_tag>/. "" = 1차 런 폴더 (grpo_models_v2_unet/)
+        run_tag="r3",              # 산출물 폴더 접미사: grpo_models_v2_<policy_kind>_<run_tag>/. r3 = old_logp 앵커·DBS 판정·깊이 1만 (r2: "r2", 1차 런: "")
     ),
     # --- 실행 ---
     "num_episodes": 8000,

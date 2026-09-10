@@ -82,7 +82,7 @@ cfg = dict(policy_kind="unet", feature_spec="field", state_gate=True, objective=
            adv_baseline="sample", images_per_batch=2, group_size=16, steps_per_image=5, update_epochs=1,
            minibatch_states=2, lr=1e-3, clip_range=0.2, kl_coef=0.04, max_grad_norm=0.5, ref_update_iters=2,
            entropy_coef=0.0, nonfinite_limit=20, adv_std_floor_rel=0.0, advance="best", num_iters=4, val_images=2,
-           val_depths=(0, 3), val_cache_dir=None, val_every=2, spawn_depth_max=3, run_tag="",
+           val_depths=(0, 3), val_cache_dir=None, val_every=2, val_dbs_steps=5, val_dbs_every=4, spawn_depth_max=3, run_tag="",
            save_every=4, startup_check=False, unet_base=8, fno_hidden=4)
 tmp = tempfile.mkdtemp(prefix="grpo_v2_smoke_")
 cfg["val_cache_dir"] = os.path.join(tmp, "val_cache")

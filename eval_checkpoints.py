@@ -298,16 +298,16 @@ if __name__ == '__main__':
     MAX_STEPS       = 20000                             # 이미지당 DBS 스텝 수. Random 곡선(+2~3 dB 에 10만~20만 시도) 기준 '의미 있는 국면'. 1차 평가는 500 (예: 500, 20000)
     STEP_MARKS      = (500, 2000, 5000, 10000, 20000)   # 이 스텝에서의 PSNR↑ 를 표로 (MAX_STEPS 이하만 의미)
     SUCCESS_MARKS   = (1000, 2000, 5000, 10000)         # 성공(채택) 횟수가 여기 닿았을 때의 PSNR↑ 를 표로 (같은 성공 수 비교)
-    NUM_EVAL_IMAGES = 10                                # 평가에 사용할 이미지 수 (0 = 전체)
+    NUM_EVAL_IMAGES = 60                                # 평가에 사용할 이미지 수 (0 = 전체). 확인 평가: 60장 중 select 20장을 뺀 report 40장
     EVAL_DIR        = '/nfs/dataset/DIV2K/DIV2K_valid_HR/DIV2K_valid_HR/'  # 평가 데이터셋 경로
     INCLUDE_RANDOM_BASELINE = True    # True: 같은 이미지·스텝으로 Random DBS 를 1회 돌려 기준선 행을 표·CSV 에 추가 (episode=0, checkpoint=random_baseline)
     INCLUDE_ORACLE_GREEDY   = True    # True: 오라클 탐욕 DBS(매 스텝 실제 최선 픽셀)를 상한 기준선으로 추가 (episode=-1, checkpoint=oracle_greedy). grpo/oracle_selftest.py 통과 후에만
     BASELINE_NAMES = ("random_baseline", "oracle_greedy")
-    EVAL_SPLIT = "all"     # "all"(지금까지와 같음) | "select"(앞 SELECT_N 장: 체크포인트 고르기용) | "report"(나머지: 고른 체크포인트 보고용)
+    EVAL_SPLIT = "report"  # "all"(지금까지와 같음) | "select"(앞 SELECT_N 장: 체크포인트 고르기용) | "report"(나머지: 고른 체크포인트 보고용). r2 it20000/30000 은 앞 10장으로 골랐으므로 보고는 report 로
                             #   같은 이미지로 고르고 보고하면 최고값이 위로 치우친다 -> 본 실험 보고는 select 로 고르고 report 로 보고한다
     SELECT_N   = 20         # EVAL_SPLIT 이 select/report 일 때의 경계 (NUM_EVAL_IMAGES 는 그 전에 적용)
     EVAL_SEEDS = None       # None: 지금처럼 시드 미고정 1회 | (0, 1, 2): 시드마다 전체를 반복해 평균과 시드 간 표준편차 열(±std)을 표·CSV 에 추가
-    CHECKPOINT_SELECT = "every:10000"  # None: 전부 | "every:10000": 반복 번호가 10000 의 배수인 것만 | (4500, 12000, 24500): 이 번호만. 2만 스텝이면 체크포인트당 ≈25분
+    CHECKPOINT_SELECT = (20000, 30000)  # None: 전부 | "every:10000": 반복 번호가 10000 의 배수인 것만 | (20000, 30000): 이 번호만. 2만 스텝이면 10장당 ≈18분
     # ════════════════════════════════════════════════════════════
 
     meta = {'wl': 515e-9, 'dx': (7.56e-6, 7.56e-6)}
