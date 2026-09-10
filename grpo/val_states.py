@@ -30,7 +30,9 @@ def build_val_states(oracle, images, depths, cache_dir, verbose=True):
                 ck = torch.load(path, map_location="cpu")
                 h = ck["h"].float().to(h0.device)
                 cur = DBSImage(oracle, T, h, name=name)
-                cur.flips = d
+                cur.flips = int(ck.get("reached", d))          # 개선 픽셀 소진으로 d 에 못 미친 캐시면 실제 도달 수
+                if cur.flips != d:
+                    print(f"  [val] {stem} 깊이 {d}: 캐시 상태는 {cur.flips} 에서 멈춘 것 (개선 픽셀 소진)")
             else:
                 if cur is None:
                     cur = DBSImage(oracle, T, h0, name=name)

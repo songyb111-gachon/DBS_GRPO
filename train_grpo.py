@@ -104,7 +104,7 @@ CONFIG = {
         advance="best",             # 상태 전진: "best"(G 개 중 R>0 최고) | "sample"(정책 샘플 1개 — 시험 시와 같은 분포)
         num_iters=20000,            # 이번 실행에서 추가로 도는 반복 수 (재개 시 누적 아님)
         val_images=2,               # 검증 이미지 수 (앞 N 장). 검증 상태 수 = val_images × len(val_depths)
-        val_depths=(0, 2000, 5000, 10000, 20000),   # 검증 상태 깊이(오라클 탐욕 채택 플립 수). 디스크 캐시라 1회만 비용 (이미지당 ≈2.5분)
+        val_depths=[0, 2000, 5000, 10000, 20000],   # 검증 상태 깊이(오라클 탐욕 채택 플립 수). 디스크 캐시라 1회만 비용 (이미지당 ≈2.5분). 리스트로 둔다 — JSON(overrides.json) 과 같은 표현
         val_cache_dir="./val_state_cache/",        # 검증 상태 캐시 폴더 (git 무시). 초기 홀로그램 해시가 키라 모델이 바뀌면 자동 재생성
         val_every=50,
         save_every=500,
@@ -754,7 +754,7 @@ if __name__ == '__main__':
     if cfg["resume_training"] and os.path.exists(checkpoint_path) and os.path.exists(overrides_path):
         with open(overrides_path, encoding="utf-8") as f:
             prev = json.load(f).get("effective_config", {})
-        now_flat, prev_flat = flatten(cfg), flatten(prev)
+        now_flat, prev_flat = flatten(json.loads(json.dumps(cfg, default=str))), flatten(prev)   # 디스크와 같은 표현으로 비교 (튜플→리스트 등)
         diffs = {k: (prev_flat[k], v) for k, v in now_flat.items()
                  if k not in RESUME_MUTABLE and k.split(".")[0] not in RESUME_MUTABLE and k in prev_flat and prev_flat[k] != v}
         if diffs:
@@ -838,7 +838,7 @@ if __name__ == '__main__':
                               "in_channels": in_ch, "state_gate": v2["state_gate"], "config": cfg}
         if v2["startup_check"]:
             from grpo.oracle import startup_consistency_check
-            startup_consistency_check(oracle, trainer.images[0].h, trainer.images[0].T)
+            startup_consistency_check(oracle, val_states[0].h, val_states[0].T)   # 깊이 0 검증 상태 (학습 상태는 첫 train() 에서 스폰된다)
         resume_from = checkpoint_path if (cfg["resume_training"] and os.path.exists(checkpoint_path)) else None
         if cfg["resume_training"] and resume_from is None:
             print(f"Warning: No checkpoint at {checkpoint_path}. Training from scratch.")

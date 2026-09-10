@@ -67,7 +67,7 @@ class GRPOTrainerV2:
         self.iteration = 0
         self.nonfinite_skips = 0   # 비유한 손실/기울기로 버린 미니배치 누적 (nonfinite_limit 에서 죽는다)
         self.extra_meta = {}      # policy_kind / feature_spec / in_channels / state_gate / config — 호출측이 채운다
-        self.images = [self._spawn() for _ in range(cfg["images_per_batch"])]
+        self.images = None      # 첫 train() 에서 ensure_images() 가 만든다 — 재개 시 체크포인트를 읽은 '뒤' 의 정책으로 스폰해야 한다
         # 검증 상태의 오라클 지도는 상태가 고정이라 한 번만
         self.val_maps = [s.reward_map().reshape(-1) for s in self.val_states]
         self.val_feats = [self._features(s) for s in self.val_states]
@@ -86,6 +86,15 @@ class GRPOTrainerV2:
             print(f"  [v2] spawn {name}: 정책 {depth} 스텝 진행 (채택 {acc}, {time.time() - t0:.0f}s) psnr {img.initial_psnr:.3f}->{img.psnr:.3f}")
         img.spawn_steps = img.steps
         return img
+
+    def ensure_images(self):
+        """학습 상태 K 개를 (없으면) 만든다. load_checkpoint 뒤에 불려야 스폰이 학습된 정책으로 된다.
+        교체 시점을 엇갈리게 하려고 이미지 i 의 첫 수명을 (K−i)/K 로 줄인다 — K 장이 같은 반복에 몰려 교체되며 수 분 멈추는 것을 막는다."""
+        if self.images is None:
+            K = int(self.cfg["images_per_batch"])
+            self.images = [self._spawn() for _ in range(K)]
+            for i, img in enumerate(self.images):
+                img.spawn_steps -= i * int(self.cfg["steps_per_image"]) // K
 
     @torch.no_grad()
     def _policy_rollout(self, img, steps):
@@ -301,6 +310,7 @@ class GRPOTrainerV2:
     def train(self, num_iters, save_dir, save_every, val_every):
         """num_iters 는 이번 실행에서 추가로 도는 반복 수 (재개 시 누적이 아님)."""
         os.makedirs(save_dir, exist_ok=True)
+        self.ensure_images()
         val_path = os.path.join(self.log_dir, "val.jsonl")
         for _ in range(num_iters):
             t0 = time.time()

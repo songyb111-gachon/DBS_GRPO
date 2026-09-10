@@ -523,11 +523,11 @@ if __name__ == '__main__':
         print(f"    {'':<22}" + "".join(f"{('step ' + str(m)):>12}" for m in marks))
         for r in all_results:
             print(f"    {os.path.basename(r['checkpoint']):<22}" + "".join(f"{r['at_step'].get(m, float('nan')):>+12.4f}" for m in marks))
-    print(f"\n  성공 횟수 도달 시 PSNR↑ (이미지 평균, 괄호 = 도달 이미지 수):")
-    print(f"    {'':<22}" + "".join(f"{('succ ' + str(m)):>16}" for m in SUCCESS_MARKS))
+    print(f"\n  성공 횟수 도달 시 PSNR↑ (도달한 실행의 평균, 괄호 = 도달 실행 수/전체 실행 수, 실행 = 이미지 × 시드):")
+    print(f"    {'':<22}" + "".join(f"{('succ ' + str(m)):>17}" for m in SUCCESS_MARKS))
     for r in all_results:
         print(f"    {os.path.basename(r['checkpoint']):<22}" + "".join(
-            f"{r['at_success'][m][0]:>+11.4f}({r['at_success'][m][1]:>2})" for m in SUCCESS_MARKS))
+            f"{r['at_success'][m][0]:>+10.4f}({r['at_success'][m][1]:>2}/{r['at_success'][m][2]:>2})" for m in SUCCESS_MARKS))
 
     # --- 결과 CSV 저장 ---
     result_dir = f"./eval_results/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}/"
@@ -555,11 +555,11 @@ if __name__ == '__main__':
 
     with open(os.path.join(result_dir, "trajectory_marks.csv"), "w") as f:
         f.write("episode,checkpoint," + ",".join(f"step{m}" for m in STEP_MARKS) + ","
-                + ",".join(f"succ{m},succ{m}_n" for m in SUCCESS_MARKS) + "\n")
+                + ",".join(f"succ{m},succ{m}_n_reached,succ{m}_n_runs" for m in SUCCESS_MARKS) + "\n")
         for r in all_results:
             f.write(f"{r['episode']},{os.path.basename(r['checkpoint'])},"
                     + ",".join(f"{r['at_step'].get(m, float('nan')):.6f}" for m in STEP_MARKS) + ","
-                    + ",".join(f"{r['at_success'][m][0]:.6f},{r['at_success'][m][1]}" for m in SUCCESS_MARKS) + "\n")
+                    + ",".join(f"{r['at_success'][m][0]:.6f},{r['at_success'][m][1]},{r['at_success'][m][2]}" for m in SUCCESS_MARKS) + "\n")
     print(f"\n  Results saved to: {result_dir}")
     print(f"  - trajectory_marks.csv       (스텝/성공 수 구간별 PSNR↑)")
     print(f"  - checkpoint_comparison.csv  (체크포인트별 요약)")
