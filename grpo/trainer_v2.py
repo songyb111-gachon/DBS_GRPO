@@ -188,11 +188,11 @@ class GRPOTrainerV2:
         cfg = self.cfg
         E, M, K = cfg["update_epochs"], cfg["minibatch_states"], len(batch)
         stats = {"loss": [], "pg": [], "kl": [], "clipfrac": [], "entropy": [], "gnorm": [],
-                 "clip_first": [], "clip_rest": [], "klclamp": [], "r10neg": [], "maxlr": []}
+                 "clip_first": [], "clip_rest": [], "klclamp": [], "r10neg": [], "maxlr": [], "fwdgap": []}
         for ep in range(E):
             self.optimizer.zero_grad(set_to_none=True)
             acc = {"loss": 0.0, "pg": 0.0, "kl": 0.0, "entropy": 0.0, "clipfrac": 0.0}
-            diag = {"klclamp": [], "r10neg": [], "maxlr": []}
+            diag = {"klclamp": [], "r10neg": [], "maxlr": [], "fwdgap": []}
             bad = False
             for s in range(0, K, M):
                 items = batch[s:s + M]
@@ -210,6 +210,13 @@ class GRPOTrainerV2:
                         pg = -(probs * it["adv_map"]).sum()
                         clipfrac = torch.zeros((), device=self.device)
                     else:
+                        if ep == 0:
+                            # μ=1 의 정의는 A·∇log π(a) 에서 π = 지금 forward 의 정책. collect(eval 모드·배치 1)의 로짓은 같은 가중치·입력이라도
+                            # 배치 M 의 forward 와 어긋난다 (cudnn 꺼진 native conv 의 GEMM 반올림이 증폭됨; r2 런 19,374 반복 중 43% 에서 max|Δlog π| ≥ 0.05,
+                            # 재개 직후엔 24 nat). 그 차이를 ratio 에 넣으면 클리핑이 무작위로 작동하므로 첫 epoch 의 old_logp 는 지금 forward 값으로 정한다.
+                            # 표본은 collect 의 분포에서 뽑혔으므로 그 차이는 무시한 중요도 가중치(≈1±잡음)이고, 크기는 fwdgap 으로 찍는다. E>1 이면 뒤 epoch 의 기준이 된다.
+                            diag["fwdgap"].append((new_lp.detach() - it["old_logp"]).abs().max())
+                            it["old_logp"] = new_lp.detach()
                         logratio = new_lp - it["old_logp"]
                         ratio = torch.exp(logratio)                              # DeepSeekMath 식 (3) 그대로, 클램프 없음
                         diag["r10neg"].append(((ratio > 10.0) & (it["adv"] < 0)).float().mean())
@@ -255,6 +262,8 @@ class GRPOTrainerV2:
             if diag["r10neg"]:
                 stats["r10neg"].append(torch.stack(diag["r10neg"]).mean().item())
                 stats["maxlr"].append(torch.stack(diag["maxlr"]).max().item())
+            if diag["fwdgap"]:
+                stats["fwdgap"].append(torch.stack(diag["fwdgap"]).max().item())
         return {k: (float(np.mean(v)) if v else float("nan")) for k, v in stats.items()}
 
     def advance(self, batch):
@@ -323,7 +332,7 @@ class GRPOTrainerV2:
             R_cat = torch.cat([it["R"] for it in batch])
             print(f"[v2 it {self.iteration}] loss={st['loss']:+.4f} pg={st['pg']:+.4f} kl={st['kl']:.4f} "
                   f"clip={st['clipfrac']:.2f} gn={st['gnorm']:.2f} H={st['entropy']:.2f} "
-                  f"klclamp={st['klclamp']:.1%} r10neg={st['r10neg']:.1%} |lr|max={st['maxlr']:.1f} "
+                  f"klclamp={st['klclamp']:.1%} r10neg={st['r10neg']:.1%} |lr|max={st['maxlr']:.1f} fwdgap={st['fwdgap']:.2f} "
                   f"distinct={np.mean([it['n_distinct'] for it in batch]):.0f}/{self.cfg['group_size']} std_min={min(it['std'] for it in batch):.1e} "
                   f"depth={np.mean([it['img'].flips for it in batch]):.0f} "
                   f"| sampled R: mean={float(R_cat.mean()):+.2e} "
